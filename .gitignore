@@ -1,0 +1,10 @@
+progress/
+.venv/
+.env
+contracts/out/
+contracts/cache/
+broadcast/
+__pycache__/
+*.pyc
+.pytest_cache/
+lcov.info

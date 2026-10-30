@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-escrow-vault"
+version = "1.0.0"
+description = "Autonomous AI Agent On-Chain Vault & Escrow Runtime on Base Sepolia"
+requires-python = ">=3.12"
+dependencies = [
+    "web3>=7.0.0",
+    "eth-account>=0.13.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
