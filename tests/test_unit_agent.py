@@ -10,7 +10,7 @@ import pytest
 
 from agent_runtime.config import AgentRuntimeConfig, LLMConfig, load_config
 from agent_runtime.llm import LLMClient, LLMError, LLMResponse, ToolCall
-from agent_runtime.x402 import decode_x402_header, encode_x402_header, probe_quote
+from agent_runtime.x402 import decode_x402_header, encode_x402_header, fetch_deliverable, probe_quote
 from agent_runtime.tools import TOOL_SCHEMAS, AgentToolbox
 from agent_runtime.evaluator import EvaluatorAgent
 from agent_runtime.provider import ProviderAgent
@@ -582,4 +582,308 @@ def test_client_agent_react_loop() -> None:
     full_transcript = json.dumps(observed_messages_snapshots[-1])
     assert "ExceedsPerTxDirectCap" in full_transcript
     assert "Rejected" in full_transcript
+
+
+def test_llm_resilience() -> None:
+    """A3: Verify LLMClient handles prose-wrapped JSON, 1-step JSON repair, 429/503 retry, and malformed tool_calls JSON."""
+    call_counter = {"count": 0}
+
+    def resilient_transport(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout: int
+    ) -> tuple[int, str]:
+        call_counter["count"] += 1
+        n = call_counter["count"]
+        # Call 1: Transient HTTP 503 Service Unavailable -> should retry automatically
+        if n == 1:
+            return 503, '{"error": "Service temporarily overloaded"}'
+        # Call 2: Prose + markdown fenced JSON -> should extract {"verdict": "PASS", ...}
+        if n == 2:
+            return 200, json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    "Here is my evaluation of the provider report:\n"
+                                    "```json\n"
+                                    '{"verdict": "PASS", "score": 88, "reasons": ["Verified 30 flows"]}\n'
+                                    "```\n"
+                                    "Hope this helps!"
+                                ),
+                            }
+                        }
+                    ]
+                }
+            )
+        # Call 3: Truncated/malformed JSON on first attempt of chat_json
+        if n == 3:
+            return 200, json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": '{"verdict": "FAIL", "score": 15, "reasons": ["Incomplete',
+                            }
+                        }
+                    ]
+                }
+            )
+        # Call 4: Repair attempt succeeds with valid JSON
+        if n == 4:
+            return 200, json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": '{"verdict": "FAIL", "score": 15, "reasons": ["Incomplete report"]}',
+                            }
+                        }
+                    ]
+                }
+            )
+        # Call 5: chat_with_tools returns markdown-fenced JSON tool_calls arguments (recoverable via _extract_json_object)
+        # and an unrecoverable truncated JSON tool_calls argument
+        return 200, json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Calling pay_direct",
+                            "tool_calls": [
+                                {
+                                    "id": "call_fenced_json",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "pay_direct",
+                                        "arguments": (
+                                            "```json\n"
+                                            '{"payee_address": "0xabc", "amount_usd": 0.005, "reason": "gas"}\n'
+                                            "```"
+                                        ),
+                                    },
+                                },
+                                {
+                                    "id": "call_bad_json",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "pay_direct",
+                                        "arguments": '{"payee_address": "0x123", "amount_usd": 0.01',
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+
+    cfg = LLMConfig(
+        api_key="sk-resilience",
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-flash",
+        client_model="deepseek-flash",
+        evaluator_model="deepseek-flash",
+        temperature=0.0,
+        timeout_seconds=5,
+    )
+    client = LLMClient(cfg, transport=resilient_transport)
+
+    # 1. Transient 503 retry + prose-wrapped JSON extraction
+    res1 = client.chat_json(
+        messages=[{"role": "user", "content": "Evaluate deliverable"}],
+        required_keys=("verdict", "score", "reasons"),
+    )
+    assert res1["verdict"] == "PASS"
+    assert res1["score"] == 88
+    assert call_counter["count"] == 2
+
+    # 2. Malformed JSON triggers 1-step repair retry and succeeds
+    res2 = client.chat_json(
+        messages=[{"role": "user", "content": "Evaluate broken deliverable"}],
+        required_keys=("verdict", "score", "reasons"),
+    )
+    assert res2["verdict"] == "FAIL"
+    assert res2["score"] == 15
+    assert call_counter["count"] == 4
+
+    # 3. Markdown-fenced tool_calls arguments JSON is recovered via _extract_json_object,
+    # while unrecoverable malformed JSON is captured as __malformed_raw__ and rejected cleanly by AgentToolbox
+    tool_resp = client.chat_with_tools(
+        messages=[{"role": "user", "content": "Pay merchant"}],
+        tools=TOOL_SCHEMAS,
+    )
+    assert len(tool_resp.tool_calls) == 2
+    assert tool_resp.tool_calls[0].arguments == {
+        "payee_address": "0xabc",
+        "amount_usd": 0.005,
+        "reason": "gas",
+    }
+    assert "__malformed_raw__" in tool_resp.tool_calls[1].arguments
+
+    class DummyCM:
+        pass
+
+    toolbox = AgentToolbox(contract_manager=DummyCM())  # type: ignore[arg-type]
+    obs = toolbox.execute_tool(
+        tool_resp.tool_calls[1].name,
+        tool_resp.tool_calls[1].arguments,
+    )
+    assert obs["ok"] is False
+    assert "Malformed JSON tool arguments" in obs["error"]
+
+
+def test_data_uri_http_handshake_and_hash_verification() -> None:
+    """A4: Verify ProviderAgent hosts deliverables over HTTP dataUri and EvaluatorAgent verifies keccak256 hash before LLM judge."""
+    from web3 import Web3
+
+    class StubChainManager:
+        def __init__(self) -> None:
+            self.jobs: dict[int, dict[str, Any]] = {}
+            self.completed: list[int] = []
+            self.rejected: list[tuple[int, str]] = []
+
+        def submit_result(
+            self,
+            job_id: int,
+            deliverable_text: str,
+            provider_private_key: str | None = None,
+            data_uri: str = "",
+        ) -> dict[str, Any]:
+            # Match ContractManager.get_job formatting: "0x" + bytes(raw[8]).hex() (always 64 hex chars)
+            result_hash = "0x" + bytes(Web3.keccak(text=deliverable_text)).hex()
+            self.jobs[job_id] = {
+                "job_id": job_id,
+                "result_hash": result_hash,
+                "data_uri": data_uri,
+                "state": "Submitted",
+                "state_code": 2,
+            }
+            return {
+                "tx_hash": f"0xsub_{job_id}",
+                "job_id": job_id,
+                "result_hash": result_hash,
+                "data_uri": data_uri,
+            }
+
+        def get_job(self, job_id: int) -> dict[str, Any]:
+            return self.jobs[job_id]
+
+        def complete_job(self, job_id: int) -> dict[str, Any]:
+            self.completed.append(job_id)
+            self.jobs[job_id]["state"] = "Completed"
+            return {"tx_hash": f"0xcomp_{job_id}", "job_id": job_id, "state": "Completed"}
+
+        def reject_job(self, job_id: int, reason: str) -> dict[str, Any]:
+            self.rejected.append((job_id, reason))
+            self.jobs[job_id]["state"] = "Rejected"
+            return {"tx_hash": f"0xrej_{job_id}", "job_id": job_id, "state": "Rejected", "reason": reason}
+
+    llm_calls: list[list[dict[str, Any]]] = []
+
+    class SpyJudgeLLM:
+        def chat_json(
+            self,
+            messages: list[dict[str, Any]],
+            required_keys: tuple[str, ...] = ("verdict", "score", "reasons"),
+            model: str | None = None,
+        ) -> dict[str, Any]:
+            llm_calls.append(messages)
+            return {"verdict": "PASS", "score": 96, "reasons": ["Verified 30 addresses via HTTP dataUri"]}
+
+    cm = StubChainManager()
+    provider_b = ProviderAgent(
+        name="Provider B",
+        mode="honest",
+        private_key="0x" + "11" * 32,
+        contract_manager=cm,  # type: ignore[arg-type]
+    )
+    evaluator = EvaluatorAgent(
+        contract_manager=cm,  # type: ignore[arg-type]
+        llm_client=SpyJudgeLLM(),  # type: ignore[arg-type]
+    )
+
+    try:
+        # 1. Provider B produces deliverable, serves it via local HTTP server, and submits dataUri + resultHash on-chain
+        sub_res = provider_b.submit_for_job(job_id=201, task_desc="30-address fund flow trace")
+        data_uri = sub_res["data_uri"]
+        assert data_uri.startswith("http://127.0.0.1:")
+        assert "/deliverables/201" in data_uri
+
+        # Verify fetch_deliverable downloads the exact deliverable over HTTP
+        downloaded = fetch_deliverable(data_uri)
+        assert downloaded == sub_res["deliverable"]
+
+        # 2. EvaluatorAgent fetches deliverable from on-chain dataUri (without deliverable_content passed in memory!),
+        # verifies keccak256 hash matches on-chain resultHash, and invokes LLM Judge -> completeJob
+        eval_res = evaluator.evaluate_and_settle(
+            job_id=201,
+            task_requirement="30-address fund flow trace",
+            acceptance_criteria=["30 address flows", "complete fields"],
+        )
+        assert eval_res["verdict"] == "PASS"
+        assert eval_res["action"] == "completeJob"
+        assert cm.completed == [201]
+        assert len(llm_calls) == 1
+
+        # 3. Deliverable whose keccak256 digest starts with a leading '0' hex nibble ("deliverable_sample_11" -> 0x02f984...):
+        # Must NOT have its leading '0' stripped by .lstrip("0x") and must pass hash verification!
+        leading_zero_text = "deliverable_sample_11"
+        assert bytes(Web3.keccak(text=leading_zero_text)).hex().startswith("0")
+        sub_203 = provider_b.submit_for_job(job_id=203, task_desc="leading zero hash verification")
+        provider_b.tamper_hosted_deliverable(203, leading_zero_text)
+        cm.submit_result(job_id=203, deliverable_text=leading_zero_text, data_uri=sub_203["data_uri"])
+        eval_leading_zero = evaluator.evaluate_and_settle(
+            job_id=203,
+            task_requirement="leading zero hash verification",
+            acceptance_criteria=["exact hash match"],
+        )
+        assert eval_leading_zero["verdict"] == "PASS"
+        assert eval_leading_zero["action"] == "completeJob"
+        assert 203 in cm.completed
+        assert len(llm_calls) == 2
+
+        # 4. Tamper with the hosted deliverable content at HTTP endpoint for job 202 after on-chain submission:
+        # EvaluatorAgent must detect keccak256 mismatch and immediately call rejectJob WITHOUT calling LLM!
+        sub_res_2 = provider_b.submit_for_job(job_id=202, task_desc="30-address fund flow trace")
+        provider_b.tamper_hosted_deliverable(202, "TAMPERED_MALICIOUS_PAYLOAD")
+
+        eval_tampered = evaluator.evaluate_and_settle(
+            job_id=202,
+            task_requirement="30-address fund flow trace",
+            acceptance_criteria=["30 address flows", "complete fields"],
+        )
+        assert eval_tampered["verdict"] == "FAIL"
+        assert eval_tampered["action"] == "rejectJob"
+        assert "hash mismatch" in eval_tampered["reasons"][0].lower()
+        assert cm.rejected[-1][0] == 202
+        # LLM judge was NOT called for the tampered deliverable
+        assert len(llm_calls) == 2
+
+        # 5. Zero-hash commitment bypass attempt (resultHash = 0x00..00 on-chain):
+        # EvaluatorAgent must NOT skip hash verification and must reject immediately without calling LLM!
+        sub_204 = provider_b.submit_for_job(job_id=204, task_desc="30-address fund flow trace")
+        cm.jobs[204] = {
+            "job_id": 204,
+            "result_hash": "0x" + ("00" * 32),
+            "data_uri": sub_204["data_uri"],
+            "state": "Submitted",
+            "state_code": 2,
+        }
+        eval_zero_hash = evaluator.evaluate_and_settle(
+            job_id=204,
+            task_requirement="30-address fund flow trace",
+            acceptance_criteria=["30 address flows"],
+        )
+        assert eval_zero_hash["verdict"] == "FAIL"
+        assert eval_zero_hash["action"] == "rejectJob"
+        assert "hash mismatch" in eval_zero_hash["reasons"][0].lower()
+        assert cm.rejected[-1][0] == 204
+        assert len(llm_calls) == 2
+    finally:
+        provider_b.close()
+
 

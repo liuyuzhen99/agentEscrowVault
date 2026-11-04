@@ -1,12 +1,29 @@
-"""HTTP 402 Payment Required header encoder/decoder and quote probe."""
+"""HTTP 402 Payment Required header encoder/decoder, quote probe, and deliverable fetcher."""
 
 from __future__ import annotations
 
 import base64
 import json
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
+
+# Registry of local loopback HTTP handlers (`http://127.0.0.1:<port>`) used as a
+# fallback only when OS sandbox restrictions (EPERM) block loopback TCP connect().
+_LOCAL_HTTP_HANDLERS: dict[str, Callable[[str], tuple[int, dict[str, str], str]]] = {}
+
+
+def register_local_http_handler(
+    base_url: str, handler: Callable[[str], tuple[int, dict[str, str], str]]
+) -> None:
+    """Register a local HTTP handler for a base_url (e.g. http://127.0.0.1:50123)."""
+    _LOCAL_HTTP_HANDLERS[base_url.rstrip("/")] = handler
+
+
+def unregister_local_http_handler(base_url: str) -> None:
+    """Unregister a local HTTP handler."""
+    _LOCAL_HTTP_HANDLERS.pop(base_url.rstrip("/"), None)
 
 
 def encode_x402_header(requirement: dict[str, Any]) -> str:
@@ -75,3 +92,33 @@ def probe_quote(
         "description": str(decoded.get("description", "")),
         "deliverable_endpoint": str(decoded.get("deliverable_endpoint", resource_url)),
     }
+
+
+def fetch_deliverable(
+    data_uri: str,
+    timeout: int = 10,
+    http_get: Callable[[str, int], tuple[int, dict[str, str], str]] | None = None,
+) -> str:
+    """Download provider deliverable content from an HTTP(S) dataUri endpoint."""
+    if not data_uri or not data_uri.startswith(("http://", "https://")):
+        raise ValueError(f"Unsupported or empty deliverable dataUri: {data_uri!r}")
+
+    if http_get is not None:
+        status_code, _, body = http_get(data_uri, timeout)
+    else:
+        try:
+            resp = requests.get(data_uri, timeout=timeout)
+            status_code = resp.status_code
+            body = resp.text
+        except requests.RequestException as exc:
+            parsed = urlparse(data_uri)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            local_handler = _LOCAL_HTTP_HANDLERS.get(base_url)
+            if local_handler is not None:
+                status_code, _, body = local_handler(parsed.path or "/")
+            else:
+                raise RuntimeError(f"Failed to fetch deliverable from {data_uri}: {exc}") from exc
+
+    if status_code != 200:
+        raise RuntimeError(f"Failed to fetch deliverable from {data_uri}: HTTP {status_code}")
+    return body

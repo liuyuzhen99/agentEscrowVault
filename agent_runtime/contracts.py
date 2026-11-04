@@ -120,13 +120,14 @@ class ContractManager:
         return receipt
 
     def get_vault_status(self, candidate_payees: list[str] | None = None) -> dict[str, Any]:
-        """Query on-chain AgentVault limits, remaining daily budget, and whitelisted payees."""
+        """Query on-chain AgentVault limits, remaining daily budget, sessionKeyExpiry, and whitelisted payees."""
         balance_raw = self._usdc.functions.balanceOf(self._vault_address).call()
         max_direct_raw = self._vault.functions.maxPerTxDirect().call()
         max_escrow_raw = self._vault.functions.maxPerTxEscrow().call()
         max_daily_raw = self._vault.functions.maxDailySpend().call()
         daily_spent_raw = self._vault.functions.dailySpendCounter().call()
         window_start = self._vault.functions.windowStartTimestamp().call()
+        session_expiry = self._vault.functions.sessionKeyExpiry().call()
         paused = self._vault.functions.paused().call()
 
         latest_ts = self._w3.eth.get_block("latest")["timestamp"]
@@ -157,6 +158,7 @@ class ContractManager:
             "max_daily_spend_usd": round(max_daily_raw / USDC_SCALE, 6),
             "daily_spend_counter_usd": round(effective_daily_spent_raw / USDC_SCALE, 6),
             "remaining_daily_budget_usd": round(remaining_daily_raw / USDC_SCALE, 6),
+            "session_key_expiry": int(session_expiry),
             "paused": bool(paused),
             "whitelisted_payees": whitelisted,
         }
@@ -213,15 +215,32 @@ class ContractManager:
         }
 
     def submit_result(
-        self, job_id: int, result_hash: bytes, provider_private_key: str
+        self,
+        job_id: int,
+        result_hash: bytes | None = None,
+        provider_private_key: str = "",
+        data_uri: str = "",
+        deliverable_text: str | None = None,
     ) -> dict[str, Any]:
         """Execute AgentEscrow.submitResult on behalf of the Provider Agent."""
-        call = self._escrow.functions.submitResult(int(job_id), result_hash)
+        if result_hash is None:
+            if deliverable_text is None:
+                raise ValueError("Either result_hash or deliverable_text must be provided")
+            result_hash = Web3.keccak(text=deliverable_text)
+
+        if data_uri:
+            call = self._escrow.functions.submitResult(
+                int(job_id), result_hash, str(data_uri)
+            )
+        else:
+            call = self._escrow.functions.submitResult(int(job_id), result_hash)
+
         receipt = self._send_tx(call, provider_private_key)
         return {
             "tx_hash": receipt["transactionHash"].hex(),
             "job_id": int(job_id),
-            "result_hash": "0x" + result_hash.hex(),
+            "result_hash": "0x" + result_hash.hex().removeprefix("0x"),
+            "data_uri": str(data_uri) if data_uri else "legacy://in-memory",
         }
 
     def complete_job(self, job_id: int) -> dict[str, Any]:
@@ -246,9 +265,20 @@ class ContractManager:
         }
 
     def claim_timeout_refund(self, job_id: int, caller_private_key: str | None = None) -> dict[str, Any]:
-        """Execute AgentEscrow.claimTimeoutRefund after deadline expiration."""
+        """Execute AgentEscrow.claimTimeoutRefund after provider delivery deadline expiration."""
         key = caller_private_key or self._agent_key or self._owner_key
         call = self._escrow.functions.claimTimeoutRefund(int(job_id))
+        receipt = self._send_tx(call, key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "job_id": int(job_id),
+            "state": "Expired",
+        }
+
+    def claim_evaluation_timeout(self, job_id: int, caller_private_key: str | None = None) -> dict[str, Any]:
+        """Execute AgentEscrow.claimEvaluationTimeout when Evaluator is unresponsive past evaluationDeadline."""
+        key = caller_private_key or self._agent_key or self._owner_key
+        call = self._escrow.functions.claimEvaluationTimeout(int(job_id))
         receipt = self._send_tx(call, key)
         return {
             "tx_hash": receipt["transactionHash"].hex(),
@@ -259,7 +289,7 @@ class ContractManager:
     def get_job(self, job_id: int) -> dict[str, Any]:
         """Inspect on-chain job struct from AgentEscrow.jobs(jobId)."""
         raw = self._escrow.functions.jobs(int(job_id)).call()
-        state_code = int(raw[7])
+        state_code = int(raw[10])
         return {
             "job_id": int(raw[0]),
             "client": str(raw[1]),
@@ -267,8 +297,12 @@ class ContractManager:
             "evaluator": str(raw[3]),
             "amount_raw": int(raw[4]),
             "amount_usd": round(int(raw[4]) / USDC_SCALE, 6),
-            "deadline": int(raw[5]),
-            "result_hash": "0x" + bytes(raw[6]).hex(),
+            "evaluator_fee_raw": int(raw[5]),
+            "evaluator_fee_usd": round(int(raw[5]) / USDC_SCALE, 6),
+            "deadline": int(raw[6]),
+            "evaluation_deadline": int(raw[7]),
+            "result_hash": "0x" + bytes(raw[8]).hex(),
+            "data_uri": str(raw[9]),
             "state_code": state_code,
             "state": JOB_STATE_NAMES.get(state_code, "Unknown"),
         }

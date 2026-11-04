@@ -7,9 +7,11 @@ interface IAgentVault {
     event EscrowRefunded(address indexed escrow, uint256 indexed jobId, uint256 amount);
     event FundsWithdrawn(address indexed to, uint256 amount);
     event KillSwitchToggled(bool isPaused);
+    event SessionKeyUpdated(address indexed newKey, uint256 expiry);
 
     error NotAuthorized();
     error ContractPaused();
+    error SessionKeyExpired(uint256 expiry, uint256 current);
     error ExceedsPerTxDirectCap(uint256 requested, uint256 max);
     error ExceedsPerTxEscrowCap(uint256 requested, uint256 max);
     error ExceedsDailySpendCap(uint256 requested, uint256 max);
@@ -33,6 +35,7 @@ interface IAgentVault {
     function withdraw(uint256 amount) external;
     function withdrawAll() external;
     function setAgentSessionKey(address newKey) external;
+    function setAgentSessionKeyWithExpiry(address newKey, uint256 expiry) external;
     function configureLimits(uint256 directCap, uint256 escrowCap, uint256 dailyCap) external;
     function setPayeeWhitelist(address payee, bool allowed) external;
     function setEscrowApproved(address escrow, bool approved) external;

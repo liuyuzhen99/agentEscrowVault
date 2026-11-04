@@ -1,12 +1,15 @@
-"""Evaluator Agent (LLM-as-a-Judge) for inspecting deliverables and settling escrow jobs."""
+"""Evaluator Agent (LLM-as-a-Judge) for fetching dataUri deliverables, verifying hashes, and settling jobs."""
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
+
+from web3 import Web3
 
 from agent_runtime.contracts import ContractManager
 from agent_runtime.llm import LLMClient, LLMError
+from agent_runtime.x402 import fetch_deliverable
 
 JUDGE_SYSTEM_PROMPT = (
     "You are an independent, neutral Evaluator Agent (LLM-as-a-Judge) for on-chain escrow "
@@ -18,7 +21,7 @@ JUDGE_SYSTEM_PROMPT = (
 
 
 class EvaluatorAgent:
-    """Arbitrates Submitted escrow jobs using LLM-as-a-Judge and triggers completeJob/rejectJob."""
+    """Arbitrates Submitted escrow jobs using on-chain hash verification + LLM-as-a-Judge."""
 
     def __init__(
         self,
@@ -81,9 +84,51 @@ class EvaluatorAgent:
         job_id: int,
         task_requirement: str,
         acceptance_criteria: list[str],
-        deliverable_content: str,
+        deliverable_content: str | None = None,
+        http_get: Callable[[str, int], tuple[int, dict[str, str], str]] | None = None,
     ) -> dict[str, Any]:
-        """Evaluate deliverable via LLM and execute completeJob or rejectJob on-chain."""
+        """Fetch deliverable via on-chain dataUri (if not passed), verify keccak256 hash, and settle job."""
+        onchain_hash = ""
+        data_uri = ""
+        if hasattr(self._cm, "get_job"):
+            job_info = self._cm.get_job(job_id)
+            onchain_hash = str(job_info.get("result_hash", ""))
+            data_uri = str(job_info.get("data_uri", ""))
+
+        if deliverable_content is None:
+            try:
+                deliverable_content = fetch_deliverable(data_uri, http_get=http_get)
+            except Exception as exc:
+                reason = f"Unreachable deliverable dataUri ({data_uri}): {exc}"
+                tx_res = self._cm.reject_job(job_id, reason)
+                return {
+                    "verdict": "FAIL",
+                    "score": 0,
+                    "reasons": [reason],
+                    "action": "rejectJob",
+                    "tx_hash": tx_res["tx_hash"],
+                    "state": "Rejected",
+                    "rejection_reason": reason,
+                }
+
+        if onchain_hash:
+            computed_hash = "0x" + Web3.keccak(text=deliverable_content).hex().removeprefix("0x")
+            if computed_hash.lower() != onchain_hash.lower():
+                reason = (
+                    f"Deliverable hash mismatch: on-chain resultHash {onchain_hash} "
+                    f"!= computed {computed_hash}"
+                )
+                tx_res = self._cm.reject_job(job_id, reason)
+                return {
+                    "verdict": "FAIL",
+                    "score": 0,
+                    "reasons": [reason],
+                    "action": "rejectJob",
+                    "tx_hash": tx_res["tx_hash"],
+                    "state": "Rejected",
+                    "rejection_reason": reason,
+                }
+
         judgment = self.evaluate_deliverable(
             task_requirement=task_requirement,
             acceptance_criteria=acceptance_criteria,

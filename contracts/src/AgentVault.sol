@@ -2,12 +2,17 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from "./IERC20.sol";
+import {SafeERC20} from "./SafeERC20.sol";
+import {ReentrancyGuard} from "./ReentrancyGuard.sol";
 import {IAgentVault} from "./IAgentVault.sol";
 import {IAgentEscrow} from "./IAgentEscrow.sol";
 
-contract AgentVault is IAgentVault {
+contract AgentVault is IAgentVault, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     address public immutable owner;
     address public agentSessionKey;
+    uint256 public sessionKeyExpiry;
     IERC20 public immutable usdc;
 
     uint256 public maxPerTxDirect;
@@ -29,11 +34,13 @@ contract AgentVault is IAgentVault {
     uint256 private constant DEFAULT_DIRECT_CAP = 10_000;   // 0.01 USDC (6 decimals)
     uint256 private constant DEFAULT_ESCROW_CAP = 60_000;   // 0.06 USDC
     uint256 private constant DEFAULT_DAILY_CAP  = 100_000;  // 0.10 USDC
+    uint256 private constant DEFAULT_SESSION_TTL = 30 days;
 
     constructor(address usdcAddress, address initialSessionKey) {
         owner = msg.sender;
         usdc = IERC20(usdcAddress);
         agentSessionKey = initialSessionKey;
+        sessionKeyExpiry = block.timestamp + DEFAULT_SESSION_TTL;
 
         maxPerTxDirect = DEFAULT_DIRECT_CAP;
         maxPerTxEscrow = DEFAULT_ESCROW_CAP;
@@ -50,6 +57,9 @@ contract AgentVault is IAgentVault {
     modifier onlyAgent() {
         if (msg.sender != agentSessionKey) revert NotAuthorized();
         if (paused) revert ContractPaused();
+        if (block.timestamp > sessionKeyExpiry) {
+            revert SessionKeyExpired(sessionKeyExpiry, block.timestamp);
+        }
         _;
     }
 
@@ -65,13 +75,13 @@ contract AgentVault is IAgentVault {
         dailySpendCounter = newTotal;
     }
 
-    function spendDirect(address to, uint256 amount) external override onlyAgent {
+    function spendDirect(address to, uint256 amount) external override nonReentrant onlyAgent {
         if (!isWhitelistedPayee[to]) revert PayeeNotWhitelisted(to);
         if (amount > maxPerTxDirect) revert ExceedsPerTxDirectCap(amount, maxPerTxDirect);
 
         _checkAndUpdateDailySpend(amount);
 
-        if (!usdc.transfer(to, amount)) revert TransferFailed();
+        usdc.safeTransfer(to, amount);
         emit DirectSpendExecuted(to, amount);
     }
 
@@ -81,20 +91,20 @@ contract AgentVault is IAgentVault {
         address evaluator,
         uint256 amount,
         uint256 deadline
-    ) external override onlyAgent returns (uint256 jobId) {
+    ) external override nonReentrant onlyAgent returns (uint256 jobId) {
         if (!isApprovedEscrow[escrow]) revert EscrowNotApproved(escrow);
         if (amount > maxPerTxEscrow) revert ExceedsPerTxEscrowCap(amount, maxPerTxEscrow);
 
         _checkAndUpdateDailySpend(amount);
 
-        if (!usdc.approve(escrow, amount)) revert TransferFailed();
+        usdc.safeApprove(escrow, amount);
         jobId = IAgentEscrow(escrow).createAndFundJob(provider, evaluator, amount, deadline);
         _jobFundedWindow[escrow][jobId] = windowStartTimestamp;
 
         emit EscrowFunded(escrow, jobId, amount);
     }
 
-    function onEscrowRefunded(uint256 jobId, uint256 amount) external override {
+    function onEscrowRefunded(uint256 jobId, uint256 amount) external override nonReentrant {
         if (!isApprovedEscrow[msg.sender]) revert NotAuthorized();
         if (
             _jobFundedWindow[msg.sender][jobId] == windowStartTimestamp &&
@@ -116,19 +126,28 @@ contract AgentVault is IAgentVault {
         emit KillSwitchToggled(false);
     }
 
-    function withdraw(uint256 amount) external override onlyOwner {
-        if (!usdc.transfer(owner, amount)) revert TransferFailed();
+    function withdraw(uint256 amount) external override nonReentrant onlyOwner {
+        usdc.safeTransfer(owner, amount);
         emit FundsWithdrawn(owner, amount);
     }
 
-    function withdrawAll() external override onlyOwner {
+    function withdrawAll() external override nonReentrant onlyOwner {
         uint256 balance = usdc.balanceOf(address(this));
-        if (!usdc.transfer(owner, balance)) revert TransferFailed();
+        usdc.safeTransfer(owner, balance);
         emit FundsWithdrawn(owner, balance);
     }
 
     function setAgentSessionKey(address newKey) external override onlyOwner {
+        uint256 expiry = block.timestamp + DEFAULT_SESSION_TTL;
         agentSessionKey = newKey;
+        sessionKeyExpiry = expiry;
+        emit SessionKeyUpdated(newKey, expiry);
+    }
+
+    function setAgentSessionKeyWithExpiry(address newKey, uint256 expiry) external override onlyOwner {
+        agentSessionKey = newKey;
+        sessionKeyExpiry = expiry;
+        emit SessionKeyUpdated(newKey, expiry);
     }
 
     function configureLimits(

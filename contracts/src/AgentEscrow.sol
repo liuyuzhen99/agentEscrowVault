@@ -2,17 +2,56 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from "./IERC20.sol";
+import {SafeERC20} from "./SafeERC20.sol";
+import {ReentrancyGuard} from "./ReentrancyGuard.sol";
 import {IAgentVault} from "./IAgentVault.sol";
 import {IAgentEscrow} from "./IAgentEscrow.sol";
 
-contract AgentEscrow is IAgentEscrow {
+contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    uint256 public constant MAX_FEE_BPS = 2_000; // Max 20%
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+
+    address public immutable owner;
     IERC20 public immutable usdc;
     uint256 public nextJobId;
 
-    mapping(uint256 => Job) public jobs;
+    uint256 public evaluationPeriod = 1 hours;
+    uint256 public evaluatorFeeBps = 500; // Default 5% (500 bps)
+
+    mapping(uint256 => Job) private _jobs;
 
     constructor(address usdcAddress) {
+        owner = msg.sender;
         usdc = IERC20(usdcAddress);
+    }
+
+    function jobs(uint256 jobId) external view override returns (Job memory) {
+        return _jobs[jobId];
+    }
+
+    function getJob(uint256 jobId) external view override returns (Job memory) {
+        return _jobs[jobId];
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) {
+            revert UnauthorizedCaller(msg.sender, owner);
+        }
+        _;
+    }
+
+    function setEvaluationPeriod(uint256 newPeriod) external override onlyOwner {
+        if (newPeriod == 0) revert InvalidEvaluationPeriod();
+        evaluationPeriod = newPeriod;
+    }
+
+    function setEvaluatorFeeBps(uint256 newFeeBps) external override onlyOwner {
+        if (newFeeBps > MAX_FEE_BPS) {
+            revert FeeTooHigh(newFeeBps, MAX_FEE_BPS);
+        }
+        evaluatorFeeBps = newFeeBps;
     }
 
     function createAndFundJob(
@@ -20,28 +59,45 @@ contract AgentEscrow is IAgentEscrow {
         address evaluator,
         uint256 amount,
         uint256 deadline
-    ) external override returns (uint256 jobId) {
-        if (!usdc.transferFrom(msg.sender, address(this), amount)) {
-            revert TransferFailed();
-        }
+    ) external override nonReentrant returns (uint256 jobId) {
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
 
+        uint256 fee = (amount * evaluatorFeeBps) / BPS_DENOMINATOR;
         jobId = ++nextJobId;
-        jobs[jobId] = Job({
+        _jobs[jobId] = Job({
             jobId: jobId,
             client: msg.sender,
             provider: provider,
             evaluator: evaluator,
             amount: amount,
+            evaluatorFee: fee,
             deadline: deadline,
+            evaluationDeadline: 0,
             resultHash: bytes32(0),
+            dataUri: "",
             state: JobState.Funded
         });
 
         emit JobCreated(jobId, msg.sender, provider, amount, deadline);
     }
 
-    function submitResult(uint256 jobId, bytes32 resultHash) external override {
-        Job storage job = jobs[jobId];
+    function submitResult(
+        uint256 jobId,
+        bytes32 resultHash,
+        string calldata dataUri
+    ) external override nonReentrant {
+        if (bytes(dataUri).length == 0) {
+            revert EmptyDataUri();
+        }
+        _submitResult(jobId, resultHash, dataUri);
+    }
+
+    function submitResult(uint256 jobId, bytes32 resultHash) external override nonReentrant {
+        _submitResult(jobId, resultHash, "legacy://in-memory");
+    }
+
+    function _submitResult(uint256 jobId, bytes32 resultHash, string memory dataUri) internal {
+        Job storage job = _jobs[jobId];
         if (job.state != JobState.Funded) {
             revert InvalidState(job.state, JobState.Funded);
         }
@@ -52,14 +108,17 @@ contract AgentEscrow is IAgentEscrow {
             revert DeadlinePassed(job.deadline, block.timestamp);
         }
 
+        uint256 evalDeadline = block.timestamp + evaluationPeriod;
         job.resultHash = resultHash;
+        job.dataUri = dataUri;
+        job.evaluationDeadline = evalDeadline;
         job.state = JobState.Submitted;
 
-        emit ResultSubmitted(jobId, resultHash);
+        emit ResultSubmitted(jobId, resultHash, dataUri, evalDeadline);
     }
 
-    function completeJob(uint256 jobId) external override {
-        Job storage job = jobs[jobId];
+    function completeJob(uint256 jobId) external override nonReentrant {
+        Job storage job = _jobs[jobId];
         if (job.state != JobState.Submitted) {
             revert InvalidState(job.state, JobState.Submitted);
         }
@@ -68,15 +127,20 @@ contract AgentEscrow is IAgentEscrow {
         }
 
         job.state = JobState.Completed;
-        if (!usdc.transfer(job.provider, job.amount)) {
-            revert TransferFailed();
-        }
+        uint256 fee = job.evaluatorFee;
+        uint256 providerPayout = job.amount - fee;
 
-        emit JobCompleted(jobId, job.provider, job.amount);
+        if (fee > 0) {
+            usdc.safeTransfer(job.evaluator, fee);
+            emit EvaluatorFeePaid(jobId, job.evaluator, fee);
+        }
+        usdc.safeTransfer(job.provider, providerPayout);
+
+        emit JobCompleted(jobId, job.provider, providerPayout);
     }
 
-    function rejectJob(uint256 jobId, string calldata reason) external override {
-        Job storage job = jobs[jobId];
+    function rejectJob(uint256 jobId, string calldata reason) external override nonReentrant {
+        Job storage job = _jobs[jobId];
         if (job.state != JobState.Submitted) {
             revert InvalidState(job.state, JobState.Submitted);
         }
@@ -85,13 +149,20 @@ contract AgentEscrow is IAgentEscrow {
         }
 
         job.state = JobState.Rejected;
-        _refundClient(job.client, jobId, job.amount);
+        uint256 fee = job.evaluatorFee;
+        uint256 refundAmount = job.amount - fee;
 
-        emit JobRejected(jobId, job.client, job.amount, reason);
+        if (fee > 0) {
+            usdc.safeTransfer(job.evaluator, fee);
+            emit EvaluatorFeePaid(jobId, job.evaluator, fee);
+        }
+        _refundClient(job.client, jobId, refundAmount);
+
+        emit JobRejected(jobId, job.client, refundAmount, reason);
     }
 
-    function claimTimeoutRefund(uint256 jobId) external override {
-        Job storage job = jobs[jobId];
+    function claimTimeoutRefund(uint256 jobId) external override nonReentrant {
+        Job storage job = _jobs[jobId];
         if (job.state != JobState.Funded) {
             revert InvalidState(job.state, JobState.Funded);
         }
@@ -105,10 +176,24 @@ contract AgentEscrow is IAgentEscrow {
         emit JobExpired(jobId, job.client, job.amount);
     }
 
-    function _refundClient(address client, uint256 jobId, uint256 amount) internal {
-        if (!usdc.transfer(client, amount)) {
-            revert TransferFailed();
+    function claimEvaluationTimeout(uint256 jobId) external override nonReentrant {
+        Job storage job = _jobs[jobId];
+        if (job.state != JobState.Submitted) {
+            revert InvalidState(job.state, JobState.Submitted);
         }
+        if (block.timestamp < job.evaluationDeadline) {
+            revert EvaluationDeadlineNotReached(job.evaluationDeadline, block.timestamp);
+        }
+
+        job.state = JobState.Expired;
+        _refundClient(job.client, jobId, job.amount);
+
+        emit EvaluationTimeoutClaimed(jobId, job.client, job.amount);
+        emit JobExpired(jobId, job.client, job.amount);
+    }
+
+    function _refundClient(address client, uint256 jobId, uint256 amount) internal {
+        usdc.safeTransfer(client, amount);
         if (client.code.length > 0) {
             IAgentVault(client).onEscrowRefunded(jobId, amount);
         }

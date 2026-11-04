@@ -5,7 +5,82 @@ import {IAgentVault} from "../src/IAgentVault.sol";
 import {IAgentEscrow} from "../src/IAgentEscrow.sol";
 import {AgentVault} from "../src/AgentVault.sol";
 import {AgentEscrow} from "../src/AgentEscrow.sol";
+import {ReentrancyGuard} from "../src/ReentrancyGuard.sol";
 import {MockUSDC} from "./MockUSDC.sol";
+
+/// @notice Non-standard ERC20 (USDT-style) that returns no boolean data on transfer/approve/transferFrom.
+contract MockNonStandardERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external {
+        require(balanceOf[msg.sender] >= amount, "insufficient");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external {
+        allowance[msg.sender][spender] = amount;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external {
+        require(balanceOf[from] >= amount, "insufficient");
+        require(allowance[from][msg.sender] >= amount, "allowance");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+    }
+}
+
+/// @notice Malicious ERC20 that attempts a reentrant call into AgentVault during transfer.
+contract MockReentrantERC20 {
+    mapping(address => uint256) public balanceOf;
+    AgentVault public targetVault;
+    address public attackerPayee;
+    bool public attackArmed;
+    bool public attackRefund;
+
+    function setAttack(AgentVault _vault, address _payee, bool _armed) external {
+        targetVault = _vault;
+        attackerPayee = _payee;
+        attackArmed = _armed;
+        attackRefund = false;
+    }
+
+    function setAttackRefund(AgentVault _vault, bool _armed) external {
+        targetVault = _vault;
+        attackRefund = _armed;
+        attackArmed = false;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        if (attackArmed) {
+            targetVault.spendDirect(attackerPayee, 1_000);
+        }
+        if (attackRefund) {
+            targetVault.onEscrowRefunded(1, 1_000);
+        }
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function transferFrom(address, address, uint256) external pure returns (bool) {
+        return true;
+    }
+}
 
 interface Vm {
     function prank(address msgSender) external;
@@ -63,8 +138,12 @@ contract AgentEscrowVaultTest {
         require(a == b, err);
     }
 
+    function _assertEqStr(string memory a, string memory b, string memory err) internal pure {
+        require(keccak256(bytes(a)) == keccak256(bytes(b)), err);
+    }
+
     // =========================================================================
-    // Vault Unit Tests (Case-V01 ~ Case-V04)
+    // Vault Unit Tests (Case-V01 ~ Case-V05)
     // =========================================================================
 
     /// @notice Case-V01: Non-Owner attempting to call configureLimits, withdraw, pause, etc. must revert.
@@ -216,28 +295,112 @@ contract AgentEscrowVaultTest {
         );
         vault.spendDirect(whitelistedMerchant, 1);
 
-        // When Provider A submits bad data and Evaluator rejects jobId, 60_000 is refunded and quota restores
+        // When Provider A submits bad data and Evaluator rejects jobId:
+        // 5% evaluatorFee (3_000) goes to evaluator, 95% (57_000) is refunded to vault and restores 57_000 of daily quota
         vm.prank(providerA);
-        escrow.submitResult(jobId, keccak256("bad_data"));
+        escrow.submitResult(jobId, keccak256("bad_data"), "http://127.0.0.1:18901/deliverables/1");
 
         vm.prank(evaluator);
         escrow.rejectJob(jobId, "Incomplete report");
-        _assertEqUint(vault.dailySpendCounter(), 40_000, "daily spend restored to 40_000 after refund");
+        _assertEqUint(vault.dailySpendCounter(), 43_000, "daily spend restored by 57_000 to 43_000 after refund");
+        _assertEqUint(usdc.balanceOf(evaluator), 3_000, "evaluator received 3_000 fee on rejectJob");
 
-        // Now Agent can hire Provider B for 60_000 within the same day (40_000 + 60_000 <= 100_000)
+        // Now Agent can hire Provider B for 57_000 within the same day (43_000 + 57_000 <= 100_000)
         vm.prank(agentSessionKey);
-        vault.fundJob(address(escrow), providerB, evaluator, 60_000, block.timestamp + 3600);
+        vault.fundJob(address(escrow), providerB, evaluator, 57_000, block.timestamp + 3600);
         _assertEqUint(vault.dailySpendCounter(), 100_000, "daily spend back to 100_000");
 
-        // Advance time by 1 day (86400s): rolling window resets on next spend
+        // Advance time by 1 day (86400s): rolling window resets on next spend (refresh session key TTL too)
         vm.warp(block.timestamp + 1 days);
         vm.prank(agentSessionKey);
         vault.spendDirect(whitelistedMerchant, 10_000);
         _assertEqUint(vault.dailySpendCounter(), 10_000, "window reset to 10_000 after 24h");
     }
 
+    /// @notice Case-V05: SessionKey TTL expiration (`SessionKeyExpired`), `SafeERC20` non-standard token compatibility, and `ReentrancyGuard`.
+    function test_Case_V05_SessionKeyExpiryAndSafeERC20AndReentrancyGuard() public {
+        // 1. Default sessionKeyExpiry is initialized to block.timestamp + 30 days
+        _assertEqUint(vault.sessionKeyExpiry(), block.timestamp + 30 days, "default TTL is 30 days");
+
+        // Owner sets explicit custom expiry via setAgentSessionKeyWithExpiry
+        uint256 customExpiry = block.timestamp + 7200;
+        vm.prank(attacker);
+        vm.expectRevert(IAgentVault.NotAuthorized.selector);
+        vault.setAgentSessionKeyWithExpiry(agentSessionKey, customExpiry);
+
+        vault.setAgentSessionKeyWithExpiry(agentSessionKey, customExpiry);
+        _assertEqUint(vault.sessionKeyExpiry(), customExpiry, "custom expiry updated");
+
+        // Warp past customExpiry: both spendDirect and fundJob must revert SessionKeyExpired
+        vm.warp(customExpiry + 1);
+        vm.prank(agentSessionKey);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAgentVault.SessionKeyExpired.selector,
+                customExpiry,
+                customExpiry + 1
+            )
+        );
+        vault.spendDirect(whitelistedMerchant, 5_000);
+
+        vm.prank(agentSessionKey);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAgentVault.SessionKeyExpired.selector,
+                customExpiry,
+                customExpiry + 1
+            )
+        );
+        vault.fundJob(address(escrow), providerA, evaluator, 10_000, block.timestamp + 3600);
+
+        // Renewing session key restores ability to spend
+        vault.setAgentSessionKey(agentSessionKey);
+        _assertEqUint(vault.sessionKeyExpiry(), block.timestamp + 30 days, "renewed TTL +30 days");
+        vm.prank(agentSessionKey);
+        vault.spendDirect(whitelistedMerchant, 5_000);
+
+        // 2. SafeERC20 compatibility with non-standard ERC20 (no return value on transfer/approve/transferFrom)
+        MockNonStandardERC20 usdtLike = new MockNonStandardERC20();
+        AgentVault usdtVault = new AgentVault(address(usdtLike), agentSessionKey);
+        AgentEscrow usdtEscrow = new AgentEscrow(address(usdtLike));
+        usdtVault.setPayeeWhitelist(whitelistedMerchant, true);
+        usdtVault.setEscrowApproved(address(usdtEscrow), true);
+        usdtLike.mint(address(usdtVault), 200_000);
+
+        vm.prank(agentSessionKey);
+        usdtVault.spendDirect(whitelistedMerchant, 10_000);
+        _assertEqUint(usdtLike.balanceOf(whitelistedMerchant), 10_000, "USDT-style direct spend succeeded");
+
+        vm.prank(agentSessionKey);
+        uint256 usdtJobId = usdtVault.fundJob(address(usdtEscrow), providerB, evaluator, 50_000, block.timestamp + 3600);
+        vm.prank(providerB);
+        usdtEscrow.submitResult(usdtJobId, keccak256("usdt_result"), "http://127.0.0.1:18901/deliverables/1");
+        vm.prank(evaluator);
+        usdtEscrow.completeJob(usdtJobId);
+        _assertEqUint(usdtLike.balanceOf(providerB), 47_500, "USDT-style provider payout succeeded");
+        _assertEqUint(usdtLike.balanceOf(evaluator), 2_500, "USDT-style evaluator fee succeeded");
+
+        // 3. ReentrancyGuard blocks malicious reentrant token callback during spendDirect
+        MockReentrantERC20 malToken = new MockReentrantERC20();
+        AgentVault malVault = new AgentVault(address(malToken), address(malToken));
+        malVault.setPayeeWhitelist(whitelistedMerchant, true);
+        malToken.mint(address(malVault), 100_000);
+        malToken.setAttack(malVault, whitelistedMerchant, true);
+
+        vm.prank(address(malToken));
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        malVault.spendDirect(whitelistedMerchant, 5_000);
+
+        // Cross-function reentrancy into onEscrowRefunded during spendDirect must also revert
+        malVault.setEscrowApproved(address(malToken), true);
+        malToken.setAttackRefund(malVault, true);
+        vm.prank(address(malToken));
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        malVault.spendDirect(whitelistedMerchant, 5_000);
+    }
+
     // =========================================================================
-    // Escrow Unit Tests (Case-E01 ~ Case-E05)
+    // Escrow Unit Tests (Case-E01 ~ Case-E06)
     // =========================================================================
 
     /// @notice Case-E01: Client locks USDC to create Job; escrow USDC balance increases by exact amount and state is Funded.
@@ -253,25 +416,19 @@ contract AgentEscrowVaultTest {
         _assertEqUint(usdc.balanceOf(address(escrow)) - escrowBefore, 50_000, "escrow balance +50_000");
         _assertEqUint(vaultBefore - usdc.balanceOf(address(vault)), 50_000, "vault balance -50_000");
 
-        (
-            uint256 id,
-            address client,
-            address provider,
-            address eval,
-            uint256 amount,
-            uint256 dl,
-            bytes32 resultHash,
-            IAgentEscrow.JobState state
-        ) = escrow.jobs(jobId);
+        IAgentEscrow.Job memory job = escrow.jobs(jobId);
 
-        _assertEqUint(id, 1, "job.jobId == 1");
-        _assertEqAddr(client, address(vault), "job.client == vault");
-        _assertEqAddr(provider, providerA, "job.provider == providerA");
-        _assertEqAddr(eval, evaluator, "job.evaluator == evaluator");
-        _assertEqUint(amount, 50_000, "job.amount == 50_000");
-        _assertEqUint(dl, deadline, "job.deadline == deadline");
-        _assertEqBytes32(resultHash, bytes32(0), "job.resultHash == 0");
-        _assertEqUint(uint256(state), uint256(IAgentEscrow.JobState.Funded), "job.state == Funded");
+        _assertEqUint(job.jobId, 1, "job.jobId == 1");
+        _assertEqAddr(job.client, address(vault), "job.client == vault");
+        _assertEqAddr(job.provider, providerA, "job.provider == providerA");
+        _assertEqAddr(job.evaluator, evaluator, "job.evaluator == evaluator");
+        _assertEqUint(job.amount, 50_000, "job.amount == 50_000");
+        _assertEqUint(job.evaluatorFee, 2_500, "job.evaluatorFee == 2_500 (5%)");
+        _assertEqUint(job.deadline, deadline, "job.deadline == deadline");
+        _assertEqUint(job.evaluationDeadline, 0, "job.evaluationDeadline == 0 before submitResult");
+        _assertEqBytes32(job.resultHash, bytes32(0), "job.resultHash == 0");
+        _assertEqStr(job.dataUri, "", "job.dataUri == empty before submitResult");
+        _assertEqUint(uint256(job.state), uint256(IAgentEscrow.JobState.Funded), "job.state == Funded");
     }
 
     /// @notice Case-E02: Non-Evaluator calling completeJob or rejectJob (and non-Provider calling submitResult) must revert.
@@ -285,10 +442,10 @@ contract AgentEscrowVaultTest {
         vm.expectRevert(
             abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, providerA)
         );
-        escrow.submitResult(jobId, keccak256("fake"));
+        escrow.submitResult(jobId, keccak256("fake"), "http://127.0.0.1:18901/deliverables/1");
 
         vm.prank(providerA);
-        escrow.submitResult(jobId, keccak256("real_deliverable"));
+        escrow.submitResult(jobId, keccak256("real_deliverable"), "http://127.0.0.1:18901/deliverables/1");
 
         // Non-evaluator trying to completeJob reverts UnauthorizedCaller
         vm.prank(attacker);
@@ -305,26 +462,30 @@ contract AgentEscrowVaultTest {
         escrow.rejectJob(jobId, "self reject attempt");
     }
 
-    /// @notice Case-E03: Evaluator passes inspection and calls completeJob; provider receives exact USDC and state becomes Completed.
+    /// @notice Case-E03: Evaluator passes inspection and calls completeJob; provider receives 95%, evaluator receives 5% fee, and state becomes Completed.
     function test_Case_E03_CompleteJobReleasesFundsToProvider() public {
         uint256 deadline = block.timestamp + 3600;
         vm.prank(agentSessionKey);
         uint256 jobId = vault.fundJob(address(escrow), providerB, evaluator, 60_000, deadline);
 
         bytes32 expectedHash = keccak256("30-address-verified-report");
+        string memory expectedUri = "http://127.0.0.1:18901/deliverables/1";
         vm.prank(providerB);
-        escrow.submitResult(jobId, expectedHash);
+        escrow.submitResult(jobId, expectedHash, expectedUri);
 
         uint256 providerBefore = usdc.balanceOf(providerB);
+        uint256 evaluatorBefore = usdc.balanceOf(evaluator);
         vm.prank(evaluator);
         escrow.completeJob(jobId);
 
-        _assertEqUint(usdc.balanceOf(providerB) - providerBefore, 60_000, "providerB received 60_000 USDC");
+        _assertEqUint(usdc.balanceOf(providerB) - providerBefore, 57_000, "providerB received 57_000 USDC (95%)");
+        _assertEqUint(usdc.balanceOf(evaluator) - evaluatorBefore, 3_000, "evaluator received 3_000 USDC (5% fee)");
         _assertEqUint(usdc.balanceOf(address(escrow)), 0, "escrow balance is 0");
 
-        (, , , , , , bytes32 storedHash, IAgentEscrow.JobState state) = escrow.jobs(jobId);
-        _assertEqBytes32(storedHash, expectedHash, "resultHash preserved");
-        _assertEqUint(uint256(state), uint256(IAgentEscrow.JobState.Completed), "state is Completed");
+        IAgentEscrow.Job memory job = escrow.getJob(jobId);
+        _assertEqBytes32(job.resultHash, expectedHash, "resultHash preserved");
+        _assertEqStr(job.dataUri, expectedUri, "dataUri preserved");
+        _assertEqUint(uint256(job.state), uint256(IAgentEscrow.JobState.Completed), "state is Completed");
 
         // Replay guard: calling completeJob or rejectJob again on Completed job must revert InvalidState
         vm.prank(evaluator);
@@ -338,27 +499,29 @@ contract AgentEscrowVaultTest {
         escrow.completeJob(jobId);
     }
 
-    /// @notice Case-E04: Evaluator rejects job via rejectJob; client vault receives refunded USDC and state becomes Rejected.
+    /// @notice Case-E04: Evaluator rejects job via rejectJob; evaluator receives 5% fee, client vault receives 95% refund, and state becomes Rejected.
     function test_Case_E04_RejectJobRefundsClientVault() public {
         uint256 deadline = block.timestamp + 3600;
         uint256 vaultBefore = usdc.balanceOf(address(vault));
+        uint256 evaluatorBefore = usdc.balanceOf(evaluator);
 
         vm.prank(agentSessionKey);
         uint256 jobId = vault.fundJob(address(escrow), providerA, evaluator, 50_000, deadline);
         _assertEqUint(usdc.balanceOf(address(vault)), vaultBefore - 50_000, "50_000 locked");
 
         vm.prank(providerA);
-        escrow.submitResult(jobId, keccak256("empty_garbage_report"));
+        escrow.submitResult(jobId, keccak256("empty_garbage_report"), "http://127.0.0.1:18901/deliverables/1");
 
         vm.prank(evaluator);
         escrow.rejectJob(jobId, "Missing 30 address flows");
 
-        _assertEqUint(usdc.balanceOf(address(vault)), vaultBefore, "vault fully refunded");
+        _assertEqUint(usdc.balanceOf(evaluator) - evaluatorBefore, 2_500, "evaluator received 2_500 fee (5%)");
+        _assertEqUint(usdc.balanceOf(address(vault)), vaultBefore - 2_500, "vault refunded 47_500 (95%)");
         _assertEqUint(usdc.balanceOf(address(escrow)), 0, "escrow emptied");
-        _assertEqUint(vault.dailySpendCounter(), 0, "vault daily spend quota restored");
+        _assertEqUint(vault.dailySpendCounter(), 2_500, "vault daily spend quota restored by 47_500");
 
-        (, , , , , , , IAgentEscrow.JobState state) = escrow.jobs(jobId);
-        _assertEqUint(uint256(state), uint256(IAgentEscrow.JobState.Rejected), "state is Rejected");
+        IAgentEscrow.Job memory job = escrow.jobs(jobId);
+        _assertEqUint(uint256(job.state), uint256(IAgentEscrow.JobState.Rejected), "state is Rejected");
 
         // Replay guard: second rejectJob reverts InvalidState
         vm.prank(evaluator);
@@ -372,7 +535,7 @@ contract AgentEscrowVaultTest {
         escrow.rejectJob(jobId, "double refund");
     }
 
-    /// @notice Case-E05: Calling claimTimeoutRefund before deadline reverts; calling at/after deadline refunds vault and marks Expired.
+    /// @notice Case-E05: Calling claimTimeoutRefund before deadline reverts; calling at/after deadline refunds vault 100% and marks Expired.
     function test_Case_E05_ClaimTimeoutRefundAndDeadlineBoundaries() public {
         uint256 deadline = block.timestamp + 3600;
         uint256 vaultBefore = usdc.balanceOf(address(vault));
@@ -400,15 +563,15 @@ contract AgentEscrowVaultTest {
                 deadline + 1
             )
         );
-        escrow.submitResult(jobId, keccak256("too_late"));
+        escrow.submitResult(jobId, keccak256("too_late"), "http://127.0.0.1:18901/deliverables/1");
 
-        // Now claimTimeoutRefund succeeds and refunds vault
+        // Now claimTimeoutRefund succeeds and refunds vault 100% (evaluator did not work)
         escrow.claimTimeoutRefund(jobId);
         _assertEqUint(usdc.balanceOf(address(vault)), vaultBefore, "vault refunded after timeout");
         _assertEqUint(vault.dailySpendCounter(), 0, "daily spend quota restored after timeout");
 
-        (, , , , , , , IAgentEscrow.JobState state) = escrow.jobs(jobId);
-        _assertEqUint(uint256(state), uint256(IAgentEscrow.JobState.Expired), "state is Expired");
+        IAgentEscrow.Job memory job = escrow.jobs(jobId);
+        _assertEqUint(uint256(job.state), uint256(IAgentEscrow.JobState.Expired), "state is Expired");
 
         // Replay guard on claimTimeoutRefund & submitResult when not Funded
         vm.expectRevert(
@@ -428,7 +591,101 @@ contract AgentEscrowVaultTest {
                 IAgentEscrow.JobState.Funded
             )
         );
-        escrow.submitResult(jobId, keccak256("expired_job"));
+        escrow.submitResult(jobId, keccak256("expired_job"), "http://127.0.0.1:18901/deliverables/1");
+    }
+
+    /// @notice Case-E06: Submitted-state secondary arbitration timeout (`claimEvaluationTimeout`), `evaluatorFeeBps` validation, and `EmptyDataUri` check.
+    function test_Case_E06_EvaluationTimeoutAndEvaluatorFeeAndDataUri() public {
+        // 1. Owner management of evaluationPeriod and evaluatorFeeBps
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, owner)
+        );
+        escrow.setEvaluationPeriod(7200);
+
+        vm.expectRevert(IAgentEscrow.InvalidEvaluationPeriod.selector);
+        escrow.setEvaluationPeriod(0);
+
+        escrow.setEvaluationPeriod(1800);
+        _assertEqUint(escrow.evaluationPeriod(), 1800, "evaluationPeriod updated to 1800s");
+
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, owner)
+        );
+        escrow.setEvaluatorFeeBps(300);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.FeeTooHigh.selector, 2001, 2000)
+        );
+        escrow.setEvaluatorFeeBps(2001);
+
+        escrow.setEvaluatorFeeBps(500);
+        _assertEqUint(escrow.evaluatorFeeBps(), 500, "evaluatorFeeBps is 500 (5%)");
+
+        // 2. Fund job and test EmptyDataUri revert
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        uint256 deadline = block.timestamp + 3600;
+        vm.prank(agentSessionKey);
+        uint256 jobId = vault.fundJob(address(escrow), providerA, evaluator, 50_000, deadline);
+
+        // Calling claimEvaluationTimeout while still Funded reverts InvalidState
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAgentEscrow.InvalidState.selector,
+                IAgentEscrow.JobState.Funded,
+                IAgentEscrow.JobState.Submitted
+            )
+        );
+        escrow.claimEvaluationTimeout(jobId);
+
+        // Empty dataUri on 3-arg submitResult reverts EmptyDataUri
+        vm.prank(providerA);
+        vm.expectRevert(IAgentEscrow.EmptyDataUri.selector);
+        escrow.submitResult(jobId, keccak256("deliverable"), "");
+
+        // Valid submitResult sets evaluationDeadline = block.timestamp + evaluationPeriod (1800s)
+        uint256 submitTs = 1_700_000_000;
+        vm.prank(providerA);
+        escrow.submitResult(jobId, keccak256("deliverable"), "http://127.0.0.1:18901/deliverables/1");
+
+        IAgentEscrow.Job memory jobSub = escrow.jobs(jobId);
+        _assertEqUint(jobSub.evaluationDeadline, submitTs + 1800, "evaluationDeadline set to submitTs + 1800");
+        _assertEqStr(jobSub.dataUri, "http://127.0.0.1:18901/deliverables/1", "dataUri stored");
+        _assertEqUint(uint256(jobSub.state), uint256(IAgentEscrow.JobState.Submitted), "state is Submitted");
+
+        // Before evaluationDeadline: claimEvaluationTimeout reverts EvaluationDeadlineNotReached
+        vm.warp(submitTs + 1799);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAgentEscrow.EvaluationDeadlineNotReached.selector,
+                submitTs + 1800,
+                submitTs + 1799
+            )
+        );
+        escrow.claimEvaluationTimeout(jobId);
+
+        // At/after evaluationDeadline: claimEvaluationTimeout refunds 100% of job.amount (50_000) to buyer vault and restores daily spend quota
+        vm.warp(submitTs + 1800);
+        uint256 evalBefore = usdc.balanceOf(evaluator);
+        escrow.claimEvaluationTimeout(jobId);
+
+        _assertEqUint(usdc.balanceOf(address(vault)), vaultBefore, "buyer vault refunded 100% on evaluator timeout");
+        _assertEqUint(usdc.balanceOf(evaluator), evalBefore, "offline evaluator receives 0 fee");
+        _assertEqUint(vault.dailySpendCounter(), 0, "buyer daily spend quota 100% restored");
+
+        IAgentEscrow.Job memory jobExp = escrow.jobs(jobId);
+        _assertEqUint(uint256(jobExp.state), uint256(IAgentEscrow.JobState.Expired), "state is Expired");
+
+        // Replay guard: calling claimEvaluationTimeout or completeJob after timeout reverts InvalidState
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAgentEscrow.InvalidState.selector,
+                IAgentEscrow.JobState.Expired,
+                IAgentEscrow.JobState.Submitted
+            )
+        );
+        escrow.claimEvaluationTimeout(jobId);
     }
 
     /// @notice Additional edge cases for ERC20 transfer failures, direct EOA client in Escrow, and cross-window refund.
@@ -445,7 +702,7 @@ contract AgentEscrowVaultTest {
         escrow.submitResult(eoaJobId, keccak256("bad"));
         vm.prank(evaluator);
         escrow.rejectJob(eoaJobId, "Rejected for EOA client");
-        _assertEqUint(usdc.balanceOf(eoaClient), 50_000, "EOA client refunded cleanly");
+        _assertEqUint(usdc.balanceOf(eoaClient), 47_500, "EOA client refunded 95% (47_500) cleanly");
 
         // 2. Cross-window refund: job funded in Window 1, refunded in Window 2 does not underflow Window 2 spend
         vm.prank(agentSessionKey);

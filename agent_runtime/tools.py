@@ -179,6 +179,12 @@ class AgentToolbox:
 
     def execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Dispatch a tool invocation and return a JSON-serializable observation dict."""
+        if "__malformed_raw__" in arguments:
+            return {
+                "ok": False,
+                "tool": name,
+                "error": f"Malformed JSON tool arguments: {arguments['__malformed_raw__']}",
+            }
         try:
             if name == "probe_quote":
                 quote = probe_quote(
