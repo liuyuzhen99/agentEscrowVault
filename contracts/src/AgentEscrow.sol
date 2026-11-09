@@ -19,7 +19,9 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
 
     uint256 public evaluationPeriod = 1 hours;
     uint256 public evaluatorFeeBps = 500; // Default 5% (500 bps)
+    uint256 public minEvaluatorStake;
 
+    mapping(address => uint256) public evaluatorStakes;
     mapping(uint256 => Job) private _jobs;
 
     constructor(address usdcAddress) {
@@ -54,12 +56,65 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
         evaluatorFeeBps = newFeeBps;
     }
 
+    function setMinEvaluatorStake(uint256 newMinStake) external override onlyOwner {
+        minEvaluatorStake = newMinStake;
+    }
+
+    function stakeEvaluator(uint256 amount) external override nonReentrant {
+        if (amount == 0) {
+            revert InvalidSlashAmount(0, evaluatorStakes[msg.sender]);
+        }
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 newStake = evaluatorStakes[msg.sender] + amount;
+        evaluatorStakes[msg.sender] = newStake;
+        emit EvaluatorStaked(msg.sender, amount, newStake);
+    }
+
+    function unstakeEvaluator(uint256 amount) external override nonReentrant {
+        uint256 available = evaluatorStakes[msg.sender];
+        if (amount == 0 || amount > available) {
+            revert InvalidSlashAmount(amount, available);
+        }
+        uint256 remaining = available - amount;
+        evaluatorStakes[msg.sender] = remaining;
+        usdc.safeTransfer(msg.sender, amount);
+        emit EvaluatorUnstaked(msg.sender, amount, remaining);
+    }
+
+    function slashEvaluator(
+        uint256 jobId,
+        address recipient,
+        uint256 slashAmount,
+        string calldata reason
+    ) external override nonReentrant onlyOwner {
+        address ev = _jobs[jobId].evaluator;
+        if (recipient == address(0) || ev == address(0)) {
+            revert InvalidRecipient();
+        }
+        uint256 available = evaluatorStakes[ev];
+        if (slashAmount == 0 || slashAmount > available) {
+            revert InvalidSlashAmount(slashAmount, available);
+        }
+        evaluatorStakes[ev] = available - slashAmount;
+        usdc.safeTransfer(recipient, slashAmount);
+        emit EvaluatorSlashed(jobId, ev, recipient, slashAmount, reason);
+    }
+
     function createAndFundJob(
         address provider,
         address evaluator,
         uint256 amount,
         uint256 deadline
     ) external override nonReentrant returns (uint256 jobId) {
+        if (
+            provider == address(0) ||
+            evaluator == address(0) ||
+            provider == evaluator ||
+            provider == msg.sender ||
+            evaluator == msg.sender
+        ) {
+            revert ConflictingParties();
+        }
         usdc.safeTransferFrom(msg.sender, address(this), amount);
 
         uint256 fee = (amount * evaluatorFeeBps) / BPS_DENOMINATOR;
@@ -125,6 +180,9 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
         if (msg.sender != job.evaluator) {
             revert UnauthorizedCaller(msg.sender, job.evaluator);
         }
+        if (evaluatorStakes[msg.sender] < minEvaluatorStake) {
+            revert InsufficientEvaluatorStake(evaluatorStakes[msg.sender], minEvaluatorStake);
+        }
 
         job.state = JobState.Completed;
         uint256 fee = job.evaluatorFee;
@@ -147,15 +205,13 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
         if (msg.sender != job.evaluator) {
             revert UnauthorizedCaller(msg.sender, job.evaluator);
         }
+        if (evaluatorStakes[msg.sender] < minEvaluatorStake) {
+            revert InsufficientEvaluatorStake(evaluatorStakes[msg.sender], minEvaluatorStake);
+        }
 
         job.state = JobState.Rejected;
-        uint256 fee = job.evaluatorFee;
-        uint256 refundAmount = job.amount - fee;
+        uint256 refundAmount = job.amount;
 
-        if (fee > 0) {
-            usdc.safeTransfer(job.evaluator, fee);
-            emit EvaluatorFeePaid(jobId, job.evaluator, fee);
-        }
         _refundClient(job.client, jobId, refundAmount);
 
         emit JobRejected(jobId, job.client, refundAmount, reason);

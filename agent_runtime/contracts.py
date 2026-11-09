@@ -306,3 +306,86 @@ class ContractManager:
             "state_code": state_code,
             "state": JOB_STATE_NAMES.get(state_code, "Unknown"),
         }
+
+    def set_evaluator_approved(self, evaluator_address: str, approved: bool = True) -> dict[str, Any]:
+        """Approve or revoke an Evaluator address on AgentVault (Owner only)."""
+        eval_cs = Web3.to_checksum_address(evaluator_address)
+        call = self._vault.functions.setEvaluatorApproved(eval_cs, bool(approved))
+        receipt = self._send_tx(call, self._owner_key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "evaluator": eval_cs,
+            "approved": bool(approved),
+        }
+
+    def set_min_evaluator_stake(self, min_stake_raw: int) -> dict[str, Any]:
+        """Configure minimum required Evaluator USDC stake on AgentEscrow (Owner only)."""
+        call = self._escrow.functions.setMinEvaluatorStake(int(min_stake_raw))
+        receipt = self._send_tx(call, self._owner_key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "min_evaluator_stake_raw": int(min_stake_raw),
+        }
+
+    def stake_evaluator(
+        self, amount_raw: int, evaluator_private_key: str | None = None
+    ) -> dict[str, Any]:
+        """Approve USDC and stake into AgentEscrow as an Evaluator."""
+        key = evaluator_private_key or self._evaluator_key
+        acct = Account.from_key(key)
+        allowance = self._usdc.functions.allowance(acct.address, self._escrow_address).call()
+        if int(allowance) < int(amount_raw):
+            approve_call = self._usdc.functions.approve(self._escrow_address, int(amount_raw))
+            self._send_tx(approve_call, key)
+        stake_call = self._escrow.functions.stakeEvaluator(int(amount_raw))
+        receipt = self._send_tx(stake_call, key)
+        total_stake = int(self._escrow.functions.evaluatorStakes(acct.address).call())
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "evaluator": acct.address,
+            "staked_raw": int(amount_raw),
+            "total_stake_raw": total_stake,
+        }
+
+    def unstake_evaluator(
+        self, amount_raw: int, evaluator_private_key: str | None = None
+    ) -> dict[str, Any]:
+        """Withdraw unstaked/unslashed Evaluator USDC deposit from AgentEscrow."""
+        key = evaluator_private_key or self._evaluator_key
+        acct = Account.from_key(key)
+        call = self._escrow.functions.unstakeEvaluator(int(amount_raw))
+        receipt = self._send_tx(call, key)
+        remaining_stake = int(self._escrow.functions.evaluatorStakes(acct.address).call())
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "evaluator": acct.address,
+            "unstaked_raw": int(amount_raw),
+            "remaining_stake_raw": remaining_stake,
+        }
+
+    def slash_evaluator(
+        self,
+        job_id: int,
+        recipient_address: str,
+        slash_amount_raw: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Slash a misbehaving Evaluator's stake on AgentEscrow and transfer to recipient (Owner only)."""
+        recipient_cs = Web3.to_checksum_address(recipient_address)
+        call = self._escrow.functions.slashEvaluator(
+            int(job_id), recipient_cs, int(slash_amount_raw), str(reason)
+        )
+        receipt = self._send_tx(call, self._owner_key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "job_id": int(job_id),
+            "recipient": recipient_cs,
+            "slash_amount_raw": int(slash_amount_raw),
+            "reason": str(reason),
+        }
+
+    def get_evaluator_stake(self, evaluator_address: str) -> int:
+        """Query current USDC stake (raw 6-decimal units) of an Evaluator on AgentEscrow."""
+        eval_cs = Web3.to_checksum_address(evaluator_address)
+        return int(self._escrow.functions.evaluatorStakes(eval_cs).call())
+

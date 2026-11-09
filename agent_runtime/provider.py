@@ -11,7 +11,11 @@ from eth_account import Account
 from web3 import Web3
 
 from agent_runtime.contracts import ContractManager
-from agent_runtime.x402 import register_local_http_handler, unregister_local_http_handler
+from agent_runtime.x402 import (
+    encrypt_deliverable_ecies,
+    register_local_http_handler,
+    unregister_local_http_handler,
+)
 
 
 def _default_deliverable_for_mode(mode: str, job_id: int, task_desc: str) -> str:
@@ -39,6 +43,7 @@ class ProviderAgent:
         address: str | None = None,
         deliverable_generator: Callable[[int, str], str] | None = None,
         mode: str = "honest",
+        recipient_pubkeys: list[str] | None = None,
     ) -> None:
         self._name = name
         self._private_key = private_key
@@ -46,6 +51,7 @@ class ProviderAgent:
         self._address = Web3.to_checksum_address(derived_addr)
         self._cm = contract_manager
         self._mode = mode
+        self._recipient_pubkeys = list(recipient_pubkeys) if recipient_pubkeys else []
         self._generator = deliverable_generator or (
             lambda jid, desc: _default_deliverable_for_mode(self._mode, jid, desc)
         )
@@ -141,9 +147,13 @@ class ProviderAgent:
                 pass
 
         deliverable_text = self._generator(job_id, task_desc)
-        self._hosted_deliverables[int(job_id)] = deliverable_text
+        if self._recipient_pubkeys:
+            hosted_payload = encrypt_deliverable_ecies(deliverable_text, self._recipient_pubkeys)
+        else:
+            hosted_payload = deliverable_text
+        self._hosted_deliverables[int(job_id)] = hosted_payload
         data_uri = f"{self._base_url}/deliverables/{int(job_id)}"
-        result_hash: bytes = Web3.keccak(text=deliverable_text)
+        result_hash: bytes = Web3.keccak(text=hosted_payload)
 
         sig = inspect.signature(self._cm.submit_result)
         if "result_hash" in sig.parameters:
@@ -156,7 +166,7 @@ class ProviderAgent:
         else:
             tx_res = self._cm.submit_result(
                 job_id=job_id,
-                deliverable_text=deliverable_text,
+                deliverable_text=hosted_payload,
                 provider_private_key=self._private_key,
                 data_uri=data_uri,
             )
@@ -165,6 +175,8 @@ class ProviderAgent:
             "job_id": job_id,
             "provider": self._address,
             "deliverable": deliverable_text,
+            "hosted_payload": hosted_payload,
+            "encrypted": bool(self._recipient_pubkeys),
             "data_uri": data_uri,
             "result_hash": tx_res["result_hash"],
             "tx_hash": tx_res["tx_hash"],

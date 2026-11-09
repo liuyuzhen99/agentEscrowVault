@@ -23,6 +23,7 @@ contract AgentVault is IAgentVault, ReentrancyGuard {
 
     mapping(address => bool) public isWhitelistedPayee;
     mapping(address => bool) public isApprovedEscrow;
+    mapping(address => bool) public isApprovedEvaluator;
 
     uint256 public dailySpendCounter;
     uint256 public windowStartTimestamp;
@@ -93,6 +94,16 @@ contract AgentVault is IAgentVault, ReentrancyGuard {
         uint256 deadline
     ) external override nonReentrant onlyAgent returns (uint256 jobId) {
         if (!isApprovedEscrow[escrow]) revert EscrowNotApproved(escrow);
+        if (!isApprovedEvaluator[evaluator]) revert EvaluatorNotApproved(evaluator);
+        if (
+            provider == address(0) ||
+            evaluator == address(0) ||
+            provider == evaluator ||
+            provider == address(this) ||
+            evaluator == address(this)
+        ) {
+            revert ConflictingParties();
+        }
         if (amount > maxPerTxEscrow) revert ExceedsPerTxEscrowCap(amount, maxPerTxEscrow);
 
         _checkAndUpdateDailySpend(amount);
@@ -166,5 +177,10 @@ contract AgentVault is IAgentVault, ReentrancyGuard {
 
     function setEscrowApproved(address escrow, bool approved) external override onlyOwner {
         isApprovedEscrow[escrow] = approved;
+    }
+
+    function setEvaluatorApproved(address evaluator, bool approved) external override onlyOwner {
+        isApprovedEvaluator[evaluator] = approved;
+        emit EvaluatorApprovalUpdated(evaluator, approved);
     }
 }

@@ -118,6 +118,7 @@ contract AgentEscrowVaultTest {
 
         vault.setPayeeWhitelist(whitelistedMerchant, true);
         vault.setEscrowApproved(address(escrow), true);
+        vault.setEvaluatorApproved(evaluator, true);
 
         usdc.mint(address(vault), INITIAL_VAULT_USDC);
     }
@@ -296,18 +297,18 @@ contract AgentEscrowVaultTest {
         vault.spendDirect(whitelistedMerchant, 1);
 
         // When Provider A submits bad data and Evaluator rejects jobId:
-        // 5% evaluatorFee (3_000) goes to evaluator, 95% (57_000) is refunded to vault and restores 57_000 of daily quota
+        // 0% evaluatorFee goes to evaluator on rejectJob (no-arbitrage rule), 100% (60_000) is refunded to vault and restores 60_000 of daily quota
         vm.prank(providerA);
         escrow.submitResult(jobId, keccak256("bad_data"), "http://127.0.0.1:18901/deliverables/1");
 
         vm.prank(evaluator);
         escrow.rejectJob(jobId, "Incomplete report");
-        _assertEqUint(vault.dailySpendCounter(), 43_000, "daily spend restored by 57_000 to 43_000 after refund");
-        _assertEqUint(usdc.balanceOf(evaluator), 3_000, "evaluator received 3_000 fee on rejectJob");
+        _assertEqUint(vault.dailySpendCounter(), 40_000, "daily spend restored by 60_000 to 40_000 after refund");
+        _assertEqUint(usdc.balanceOf(evaluator), 0, "evaluator received 0 fee on rejectJob");
 
-        // Now Agent can hire Provider B for 57_000 within the same day (43_000 + 57_000 <= 100_000)
+        // Now Agent can hire Provider B for 60_000 within the same day (40_000 + 60_000 <= 100_000)
         vm.prank(agentSessionKey);
-        vault.fundJob(address(escrow), providerB, evaluator, 57_000, block.timestamp + 3600);
+        vault.fundJob(address(escrow), providerB, evaluator, 60_000, block.timestamp + 3600);
         _assertEqUint(vault.dailySpendCounter(), 100_000, "daily spend back to 100_000");
 
         // Advance time by 1 day (86400s): rolling window resets on next spend (refresh session key TTL too)
@@ -365,6 +366,7 @@ contract AgentEscrowVaultTest {
         AgentEscrow usdtEscrow = new AgentEscrow(address(usdtLike));
         usdtVault.setPayeeWhitelist(whitelistedMerchant, true);
         usdtVault.setEscrowApproved(address(usdtEscrow), true);
+        usdtVault.setEvaluatorApproved(evaluator, true);
         usdtLike.mint(address(usdtVault), 200_000);
 
         vm.prank(agentSessionKey);
@@ -397,6 +399,84 @@ contract AgentEscrowVaultTest {
         vm.prank(address(malToken));
         vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
         malVault.spendDirect(whitelistedMerchant, 5_000);
+    }
+
+    /// @notice Case-V06: Evaluator whitelist (`isApprovedEvaluator`) and conflict-of-interest checks (`ConflictingParties`).
+    function test_Case_V06_EvaluatorWhitelistAndConflictChecks() public {
+        uint256 deadline = block.timestamp + 3600;
+
+        // 1. Non-owner cannot call setEvaluatorApproved
+        vm.prank(attacker);
+        vm.expectRevert(IAgentVault.NotAuthorized.selector);
+        vault.setEvaluatorApproved(attacker, true);
+
+        // 2. Unapproved evaluator in vault.fundJob reverts EvaluatorNotApproved
+        vm.prank(agentSessionKey);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentVault.EvaluatorNotApproved.selector, attacker)
+        );
+        vault.fundJob(address(escrow), providerA, attacker, 50_000, deadline);
+
+        // 3. Conflict of interest checks in vault.fundJob:
+        //    - provider == address(0)
+        vm.prank(agentSessionKey);
+        vm.expectRevert(IAgentVault.ConflictingParties.selector);
+        vault.fundJob(address(escrow), address(0), evaluator, 50_000, deadline);
+
+        //    - provider == evaluator (collusion between provider and evaluator)
+        vm.prank(agentSessionKey);
+        vm.expectRevert(IAgentVault.ConflictingParties.selector);
+        vault.fundJob(address(escrow), evaluator, evaluator, 50_000, deadline);
+
+        //    - provider == address(vault) (self-dealing)
+        vm.prank(agentSessionKey);
+        vm.expectRevert(IAgentVault.ConflictingParties.selector);
+        vault.fundJob(address(escrow), address(vault), evaluator, 50_000, deadline);
+
+        //    - evaluator == address(vault) (even if vault address is marked approved)
+        vault.setEvaluatorApproved(address(vault), true);
+        vm.prank(agentSessionKey);
+        vm.expectRevert(IAgentVault.ConflictingParties.selector);
+        vault.fundJob(address(escrow), providerA, address(vault), 50_000, deadline);
+        vault.setEvaluatorApproved(address(vault), false);
+
+        //    - evaluator == address(0) (even if address(0) is marked approved)
+        vault.setEvaluatorApproved(address(0), true);
+        vm.prank(agentSessionKey);
+        vm.expectRevert(IAgentVault.ConflictingParties.selector);
+        vault.fundJob(address(escrow), providerA, address(0), 50_000, deadline);
+        vault.setEvaluatorApproved(address(0), false);
+
+        // 4. Direct AgentEscrow.createAndFundJob conflict-of-interest checks
+        address directClient = address(0xC11E);
+        usdc.mint(directClient, 100_000);
+        vm.prank(directClient);
+        usdc.approve(address(escrow), 100_000);
+
+        //    - provider == address(0)
+        vm.prank(directClient);
+        vm.expectRevert(IAgentEscrow.ConflictingParties.selector);
+        escrow.createAndFundJob(address(0), evaluator, 10_000, deadline);
+
+        //    - evaluator == address(0)
+        vm.prank(directClient);
+        vm.expectRevert(IAgentEscrow.ConflictingParties.selector);
+        escrow.createAndFundJob(providerA, address(0), 10_000, deadline);
+
+        //    - provider == evaluator
+        vm.prank(directClient);
+        vm.expectRevert(IAgentEscrow.ConflictingParties.selector);
+        escrow.createAndFundJob(providerA, providerA, 10_000, deadline);
+
+        //    - provider == msg.sender (client == provider)
+        vm.prank(directClient);
+        vm.expectRevert(IAgentEscrow.ConflictingParties.selector);
+        escrow.createAndFundJob(directClient, evaluator, 10_000, deadline);
+
+        //    - evaluator == msg.sender (client == evaluator)
+        vm.prank(directClient);
+        vm.expectRevert(IAgentEscrow.ConflictingParties.selector);
+        escrow.createAndFundJob(providerA, directClient, 10_000, deadline);
     }
 
     // =========================================================================
@@ -499,7 +579,7 @@ contract AgentEscrowVaultTest {
         escrow.completeJob(jobId);
     }
 
-    /// @notice Case-E04: Evaluator rejects job via rejectJob; evaluator receives 5% fee, client vault receives 95% refund, and state becomes Rejected.
+    /// @notice Case-E04: Evaluator rejects job via rejectJob; evaluator receives 0 fee (no arbitrage), client vault receives 100% refund, and state becomes Rejected.
     function test_Case_E04_RejectJobRefundsClientVault() public {
         uint256 deadline = block.timestamp + 3600;
         uint256 vaultBefore = usdc.balanceOf(address(vault));
@@ -515,10 +595,10 @@ contract AgentEscrowVaultTest {
         vm.prank(evaluator);
         escrow.rejectJob(jobId, "Missing 30 address flows");
 
-        _assertEqUint(usdc.balanceOf(evaluator) - evaluatorBefore, 2_500, "evaluator received 2_500 fee (5%)");
-        _assertEqUint(usdc.balanceOf(address(vault)), vaultBefore - 2_500, "vault refunded 47_500 (95%)");
+        _assertEqUint(usdc.balanceOf(evaluator) - evaluatorBefore, 0, "evaluator received 0 fee on rejectJob");
+        _assertEqUint(usdc.balanceOf(address(vault)), vaultBefore, "vault refunded 50_000 (100%)");
         _assertEqUint(usdc.balanceOf(address(escrow)), 0, "escrow emptied");
-        _assertEqUint(vault.dailySpendCounter(), 2_500, "vault daily spend quota restored by 47_500");
+        _assertEqUint(vault.dailySpendCounter(), 0, "vault daily spend quota restored 100%");
 
         IAgentEscrow.Job memory job = escrow.jobs(jobId);
         _assertEqUint(uint256(job.state), uint256(IAgentEscrow.JobState.Rejected), "state is Rejected");
@@ -688,6 +768,118 @@ contract AgentEscrowVaultTest {
         escrow.claimEvaluationTimeout(jobId);
     }
 
+    /// @notice Case-E07: Evaluator staking (`stakeEvaluator`), minimum stake enforcement (`minEvaluatorStake`), slashing (`slashEvaluator`), and unstaking (`unstakeEvaluator`).
+    function test_Case_E07_EvaluatorStakingSlashingAndZeroRejectArbitrage() public {
+        uint256 deadline = block.timestamp + 3600;
+
+        // 1. Non-owner cannot set minEvaluatorStake
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, owner)
+        );
+        escrow.setMinEvaluatorStake(20_000);
+
+        // Owner sets minEvaluatorStake = 20_000 (0.02 USDC)
+        escrow.setMinEvaluatorStake(20_000);
+        _assertEqUint(escrow.minEvaluatorStake(), 20_000, "minEvaluatorStake set to 20_000");
+
+        // Fund a job and submit result
+        vm.prank(agentSessionKey);
+        uint256 jobId1 = vault.fundJob(address(escrow), providerA, evaluator, 50_000, deadline);
+        vm.prank(providerA);
+        escrow.submitResult(jobId1, keccak256("report_1"), "http://127.0.0.1:18901/deliverables/1");
+
+        // 2. Evaluator with 0 stake cannot call completeJob or rejectJob when minEvaluatorStake == 20_000
+        vm.prank(evaluator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InsufficientEvaluatorStake.selector, 0, 20_000)
+        );
+        escrow.completeJob(jobId1);
+
+        vm.prank(evaluator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InsufficientEvaluatorStake.selector, 0, 20_000)
+        );
+        escrow.rejectJob(jobId1, "lazy reject attempt without stake");
+
+        // 3. Staking 0 reverts InvalidSlashAmount
+        vm.prank(evaluator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 0, 0)
+        );
+        escrow.stakeEvaluator(0);
+
+        // Mint 30_000 USDC to evaluator and stake 25_000 USDC
+        usdc.mint(evaluator, 30_000);
+        vm.prank(evaluator);
+        usdc.approve(address(escrow), 30_000);
+        vm.prank(evaluator);
+        escrow.stakeEvaluator(25_000);
+        _assertEqUint(escrow.evaluatorStakes(evaluator), 25_000, "evaluator stake is 25_000");
+
+        // 4. Evaluator now has sufficient stake (>= 20_000) to settle jobId1 via rejectJob
+        uint256 vaultBeforeReject = usdc.balanceOf(address(vault));
+        uint256 evalBeforeReject = usdc.balanceOf(evaluator);
+        vm.prank(evaluator);
+        escrow.rejectJob(jobId1, "Malicious lazy reject");
+        _assertEqUint(usdc.balanceOf(evaluator), evalBeforeReject, "evaluator earned 0 fee on rejectJob");
+        _assertEqUint(usdc.balanceOf(address(vault)) - vaultBeforeReject, 50_000, "buyer refunded 100% on rejectJob");
+
+        // 5. Slashing validation and execution (Owner challenges malicious evaluator on jobId1)
+        //    - Non-owner cannot slash
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, owner)
+        );
+        escrow.slashEvaluator(jobId1, providerA, 10_000, "unauthorized slash");
+
+        //    - Zero recipient reverts InvalidRecipient
+        vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
+        escrow.slashEvaluator(jobId1, address(0), 10_000, "zero recipient");
+
+        //    - Non-existent jobId (evaluator == address(0)) reverts InvalidRecipient
+        vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
+        escrow.slashEvaluator(999, providerA, 10_000, "unknown job");
+
+        //    - Zero slashAmount or slashAmount > stake reverts InvalidSlashAmount
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 0, 25_000)
+        );
+        escrow.slashEvaluator(jobId1, providerA, 0, "zero slash");
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 25_001, 25_000)
+        );
+        escrow.slashEvaluator(jobId1, providerA, 25_001, "excessive slash");
+
+        //    - Valid slash: slash 15_000 from evaluator and compensate providerA
+        uint256 providerBeforeSlash = usdc.balanceOf(providerA);
+        escrow.slashEvaluator(jobId1, providerA, 15_000, "Malicious lazy rejection proven");
+        _assertEqUint(escrow.evaluatorStakes(evaluator), 10_000, "evaluator remaining stake is 10_000");
+        _assertEqUint(usdc.balanceOf(providerA) - providerBeforeSlash, 15_000, "providerA received 15_000 slashed stake");
+
+        // 6. Unstaking validation and execution
+        //    - Unstaking 0 or > remaining stake (10_000) reverts InvalidSlashAmount
+        vm.prank(evaluator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 0, 10_000)
+        );
+        escrow.unstakeEvaluator(0);
+
+        vm.prank(evaluator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 10_001, 10_000)
+        );
+        escrow.unstakeEvaluator(10_001);
+
+        //    - Valid unstake of remaining 10_000
+        uint256 evalBeforeUnstake = usdc.balanceOf(evaluator);
+        vm.prank(evaluator);
+        escrow.unstakeEvaluator(10_000);
+        _assertEqUint(escrow.evaluatorStakes(evaluator), 0, "evaluator stake is 0 after unstake");
+        _assertEqUint(usdc.balanceOf(evaluator) - evalBeforeUnstake, 10_000, "evaluator withdrew remaining 10_000 stake");
+    }
+
     /// @notice Additional edge cases for ERC20 transfer failures, direct EOA client in Escrow, and cross-window refund.
     function test_Case_Edge_TransferFailureAndCrossWindowRefund() public {
         // 1. Direct EOA client creating a job directly on AgentEscrow (non-contract client)
@@ -702,7 +894,7 @@ contract AgentEscrowVaultTest {
         escrow.submitResult(eoaJobId, keccak256("bad"));
         vm.prank(evaluator);
         escrow.rejectJob(eoaJobId, "Rejected for EOA client");
-        _assertEqUint(usdc.balanceOf(eoaClient), 47_500, "EOA client refunded 95% (47_500) cleanly");
+        _assertEqUint(usdc.balanceOf(eoaClient), 50_000, "EOA client refunded 100% (50_000) cleanly");
 
         // 2. Cross-window refund: job funded in Window 1, refunded in Window 2 does not underflow Window 2 spend
         vm.prank(agentSessionKey);

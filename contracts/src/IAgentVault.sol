@@ -8,6 +8,7 @@ interface IAgentVault {
     event FundsWithdrawn(address indexed to, uint256 amount);
     event KillSwitchToggled(bool isPaused);
     event SessionKeyUpdated(address indexed newKey, uint256 expiry);
+    event EvaluatorApprovalUpdated(address indexed evaluator, bool approved);
 
     error NotAuthorized();
     error ContractPaused();
@@ -17,6 +18,8 @@ interface IAgentVault {
     error ExceedsDailySpendCap(uint256 requested, uint256 max);
     error PayeeNotWhitelisted(address payee);
     error EscrowNotApproved(address escrow);
+    error EvaluatorNotApproved(address evaluator);
+    error ConflictingParties();
     error TransferFailed();
 
     function spendDirect(address to, uint256 amount) external;
@@ -39,4 +42,5 @@ interface IAgentVault {
     function configureLimits(uint256 directCap, uint256 escrowCap, uint256 dailyCap) external;
     function setPayeeWhitelist(address payee, bool allowed) external;
     function setEscrowApproved(address escrow, bool approved) external;
+    function setEvaluatorApproved(address evaluator, bool approved) external;
 }
