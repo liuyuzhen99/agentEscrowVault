@@ -825,7 +825,7 @@ contract AgentEscrowVaultTest {
         _assertEqUint(usdc.balanceOf(evaluator), evalBeforeReject, "evaluator earned 0 fee on rejectJob");
         _assertEqUint(usdc.balanceOf(address(vault)) - vaultBeforeReject, 50_000, "buyer refunded 100% on rejectJob");
 
-        // 5. Slashing validation and execution (Owner challenges malicious evaluator on jobId1)
+        // 5. Slashing validation and execution (Party raises dispute first, then Owner challenges malicious evaluator on jobId1)
         //    - Non-owner cannot slash
         vm.prank(attacker);
         vm.expectRevert(
@@ -837,9 +837,29 @@ contract AgentEscrowVaultTest {
         vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
         escrow.slashEvaluator(jobId1, address(0), 10_000, "zero recipient");
 
+        //    - Owner attempting to slash to owner itself (self-dealing) reverts InvalidRecipient
+        vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
+        escrow.slashEvaluator(jobId1, owner, 10_000, "self-dealing attempt");
+
+        //    - Recipient not party to job (neither job.client nor job.provider) reverts InvalidRecipient
+        vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
+        escrow.slashEvaluator(jobId1, attacker, 10_000, "unrelated recipient");
+
         //    - Non-existent jobId (evaluator == address(0)) reverts InvalidRecipient
         vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
         escrow.slashEvaluator(999, providerA, 10_000, "unknown job");
+
+        //    - Slashing without prior party dispute reverts DisputeNotRaised
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.DisputeNotRaised.selector, jobId1)
+        );
+        escrow.slashEvaluator(jobId1, providerA, 15_000, "no dispute yet");
+
+        //    - Affected providerA raises on-chain dispute for jobId1
+        vm.prank(providerA);
+        escrow.raiseDispute(jobId1, "Evaluator lazily rejected valid 30-address report");
+        _assertEqBool(escrow.jobDisputed(jobId1), true, "jobId1 marked disputed");
+        _assertEqAddr(escrow.jobDisputant(jobId1), providerA, "jobId1 disputant is providerA");
 
         //    - Zero slashAmount or slashAmount > stake reverts InvalidSlashAmount
         vm.expectRevert(
@@ -878,6 +898,276 @@ contract AgentEscrowVaultTest {
         escrow.unstakeEvaluator(10_000);
         _assertEqUint(escrow.evaluatorStakes(evaluator), 0, "evaluator stake is 0 after unstake");
         _assertEqUint(usdc.balanceOf(evaluator) - evalBeforeUnstake, 10_000, "evaluator withdrew remaining 10_000 stake");
+    }
+
+    /// @notice Case-E08 (A1): On-chain ECIES uncompressed secp256k1 public key registry & AgentVault key binding.
+    function test_Case_E08_OnchainEncryptionPublicKeyRegistry() public {
+        bytes memory validPayload64 = abi.encodePacked(bytes32(uint256(0x1111)), bytes32(uint256(0x2222)));
+        bytes memory validPubKey = abi.encodePacked(bytes1(0x04), validPayload64);
+        address derivedAddr = address(uint160(uint256(keccak256(validPayload64))));
+
+        // 1. Invalid length (!= 65) or invalid prefix (!= 0x04) reverts InvalidPublicKey
+        vm.prank(derivedAddr);
+        vm.expectRevert(IAgentEscrow.InvalidPublicKey.selector);
+        escrow.registerEncryptionPublicKey(hex"04112233");
+
+        bytes memory wrongPrefixKey = abi.encodePacked(bytes1(0x02), validPayload64);
+        vm.prank(derivedAddr);
+        vm.expectRevert(IAgentEscrow.InvalidPublicKey.selector);
+        escrow.registerEncryptionPublicKey(wrongPrefixKey);
+
+        // 2. Spoofing another account's public key (derivedAddr != msg.sender) reverts InvalidPublicKey
+        vm.prank(attacker);
+        vm.expectRevert(IAgentEscrow.InvalidPublicKey.selector);
+        escrow.registerEncryptionPublicKey(validPubKey);
+
+        // 3. Valid self-authenticated registration succeeds
+        vm.prank(derivedAddr);
+        escrow.registerEncryptionPublicKey(validPubKey);
+        bytes memory fetched = escrow.getEncryptionPublicKey(derivedAddr);
+        _assertEqBytes32(keccak256(fetched), keccak256(validPubKey), "registered pubKey matches");
+
+        // 4. Vault encryption public key registration (for AgentVault client contracts)
+        bytes memory sessionPayload64 = abi.encodePacked(bytes32(uint256(0xAAAA)), bytes32(uint256(0xBBBB)));
+        bytes memory sessionPubKey = abi.encodePacked(bytes1(0x04), sessionPayload64);
+        address derivedSessionKey = address(uint160(uint256(keccak256(sessionPayload64))));
+
+        bytes memory ownerPayload64 = abi.encodePacked(bytes32(uint256(0xCCCC)), bytes32(uint256(0xDDDD)));
+        bytes memory ownerPubKey = abi.encodePacked(bytes1(0x04), ownerPayload64);
+        address derivedOwnerKey = address(uint160(uint256(keccak256(ownerPayload64))));
+
+        // Deploy a vault owned by derivedOwnerKey with session key derivedSessionKey
+        vm.prank(derivedOwnerKey);
+        AgentVault pkiVault = new AgentVault(address(usdc), derivedSessionKey);
+
+        //    - Zero vault or EOA vault (code.length == 0) reverts InvalidRecipient
+        vm.prank(derivedSessionKey);
+        vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
+        escrow.registerVaultEncryptionPublicKey(address(0), sessionPubKey);
+
+        vm.prank(derivedSessionKey);
+        vm.expectRevert(IAgentEscrow.InvalidRecipient.selector);
+        escrow.registerVaultEncryptionPublicKey(attacker, sessionPubKey);
+
+        //    - Unauthorized caller (attacker) reverts UnauthorizedCaller
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, derivedSessionKey)
+        );
+        escrow.registerVaultEncryptionPublicKey(address(pkiVault), sessionPubKey);
+
+        //    - Authorized caller passing a pubKey that matches neither vault.agentSessionKey() nor vault.owner() reverts InvalidPublicKey
+        vm.prank(derivedSessionKey);
+        vm.expectRevert(IAgentEscrow.InvalidPublicKey.selector);
+        escrow.registerVaultEncryptionPublicKey(address(pkiVault), validPubKey);
+
+        //    - Session key registers sessionPubKey for pkiVault
+        vm.prank(derivedSessionKey);
+        escrow.registerVaultEncryptionPublicKey(address(pkiVault), sessionPubKey);
+        _assertEqBytes32(
+            keccak256(escrow.getEncryptionPublicKey(address(pkiVault))),
+            keccak256(sessionPubKey),
+            "vault pubKey registered by sessionKey"
+        );
+
+        //    - Vault owner can also update vault pubKey to ownerPubKey
+        vm.prank(derivedOwnerKey);
+        escrow.registerVaultEncryptionPublicKey(address(pkiVault), ownerPubKey);
+        _assertEqBytes32(
+            keccak256(escrow.getEncryptionPublicKey(address(pkiVault))),
+            keccak256(ownerPubKey),
+            "vault pubKey updated by vault owner"
+        );
+    }
+
+    /// @notice Case-E09 (A2): Provider performance bond (`providerBond`) symmetric Evaluator incentive, objective timeout slashing, and dispute-gated slashing.
+    function test_Case_E09_ProviderBondSymmetricIncentiveAndDisputeGatedSlashing() public {
+        uint256 deadline = block.timestamp + 3600;
+
+        // 1. Only owner can toggle requireProviderBond
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, owner)
+        );
+        escrow.setRequireProviderBond(true);
+
+        escrow.setRequireProviderBond(true);
+        _assertEqBool(escrow.requireProviderBond(), true, "requireProviderBond enabled");
+
+        // 2. Provider staking validation: staking 0 reverts InvalidSlashAmount
+        vm.prank(providerA);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 0, 0)
+        );
+        escrow.stakeProvider(0);
+
+        // Fund jobId1 (amount = 40_000, evaluatorFee = 2_000 at 5%)
+        vm.prank(agentSessionKey);
+        uint256 jobId1 = vault.fundJob(address(escrow), providerA, evaluator, 40_000, deadline);
+
+        // Submitting result when requireProviderBond=true and providerStakes[providerA]=0 reverts InsufficientProviderBond
+        vm.prank(providerA);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InsufficientProviderBond.selector, 0, 2_000)
+        );
+        escrow.submitResult(jobId1, keccak256("fraud_report"), "http://127.0.0.1:18901/deliverables/1");
+
+        // ProviderA stakes 5_000 USDC
+        usdc.mint(providerA, 5_000);
+        vm.prank(providerA);
+        usdc.approve(address(escrow), 5_000);
+        vm.prank(providerA);
+        escrow.stakeProvider(5_000);
+        _assertEqUint(escrow.providerStakes(providerA), 5_000, "providerA stake is 5_000");
+
+        // Submit result for jobId1 locks 2_000 providerBond (leaving 3_000 available)
+        vm.prank(providerA);
+        escrow.submitResult(jobId1, keccak256("fraud_report"), "http://127.0.0.1:18901/deliverables/1");
+        _assertEqUint(escrow.providerStakes(providerA), 3_000, "providerA available stake reduced to 3_000");
+        _assertEqUint(escrow.jobProviderBonds(jobId1), 2_000, "jobId1 locked 2_000 providerBond");
+
+        // 3. Rejecting jobId1: Buyer Vault gets 100% refund (40_000), AND Evaluator gets 2_000 fee from ProviderA's slashed bond!
+        uint256 vaultBefore1 = usdc.balanceOf(address(vault));
+        uint256 evalBefore1 = usdc.balanceOf(evaluator);
+        vm.prank(evaluator);
+        escrow.rejectJob(jobId1, "Fraudulent deliverable");
+        _assertEqUint(usdc.balanceOf(address(vault)) - vaultBefore1, 40_000, "buyer refunded 100% (40_000)");
+        _assertEqUint(usdc.balanceOf(evaluator) - evalBefore1, 2_000, "evaluator received 2_000 symmetric fee from providerBond on rejectJob");
+        _assertEqUint(escrow.jobProviderBonds(jobId1), 0, "jobId1 providerBond cleared");
+        _assertEqUint(escrow.providerStakes(providerA), 3_000, "providerA forfeited the 2_000 locked bond");
+
+        // 4. Completing jobId2 (PASS): Evaluator gets 2_000 fee from job amount, ProviderB gets 38_000 + 100% of its 2_000 bond unlocked!
+        usdc.mint(providerB, 2_000);
+        vm.prank(providerB);
+        usdc.approve(address(escrow), 2_000);
+        vm.prank(providerB);
+        escrow.stakeProvider(2_000);
+
+        vm.prank(agentSessionKey);
+        uint256 jobId2 = vault.fundJob(address(escrow), providerB, evaluator, 40_000, deadline);
+        vm.prank(providerB);
+        escrow.submitResult(jobId2, keccak256("honest_report"), "http://127.0.0.1:18901/deliverables/2");
+        _assertEqUint(escrow.providerStakes(providerB), 0, "providerB bond locked during submission");
+        _assertEqUint(escrow.jobProviderBonds(jobId2), 2_000, "jobId2 bond is 2_000");
+
+        uint256 evalBefore2 = usdc.balanceOf(evaluator);
+        uint256 provBBefore2 = usdc.balanceOf(providerB);
+        vm.prank(evaluator);
+        escrow.completeJob(jobId2);
+        _assertEqUint(usdc.balanceOf(evaluator) - evalBefore2, 2_000, "evaluator received 2_000 fee on completeJob");
+        _assertEqUint(usdc.balanceOf(providerB) - provBBefore2, 38_000, "providerB received 95% payout (38_000)");
+        _assertEqUint(escrow.providerStakes(providerB), 2_000, "providerB 2_000 bond unlocked back to providerStakes");
+
+        // ProviderB unstakes its 2_000 bond (and test invalid unstake bounds)
+        vm.prank(providerB);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 0, 2_000)
+        );
+        escrow.unstakeProvider(0);
+
+        vm.prank(providerB);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.InvalidSlashAmount.selector, 2_001, 2_000)
+        );
+        escrow.unstakeProvider(2_001);
+
+        vm.prank(providerB);
+        escrow.unstakeProvider(2_000);
+        _assertEqUint(escrow.providerStakes(providerB), 0, "providerB stake 0 after unstake");
+        _assertEqUint(usdc.balanceOf(providerB) - provBBefore2, 40_000, "providerB holds 38_000 payout + 2_000 unstaked bond");
+
+        // 5. Evaluation timeout liveness slashing:
+        //    Evaluator stakes 1_500 USDC. JobId3 has evaluatorFee = 2_000.
+        //    ProviderA submits (locking 2_000 bond from its remaining 3_000 stake).
+        //    Evaluator goes offline past evaluationDeadline -> claimEvaluationTimeout:
+        //    - Buyer gets 100% refund (40_000);
+        //    - ProviderA's 2_000 bond is unlocked back to providerStakes[providerA] (3_000);
+        //    - Offline Evaluator is automatically slashed min(2_000, 1_500) = 1_500 USDC, paid to ProviderA!
+        usdc.mint(evaluator, 5_000);
+        vm.prank(evaluator);
+        usdc.approve(address(escrow), 5_000);
+        vm.prank(evaluator);
+        escrow.stakeEvaluator(1_500);
+
+        vm.prank(agentSessionKey);
+        uint256 jobId3 = vault.fundJob(address(escrow), providerA, evaluator, 40_000, deadline);
+
+        // Cannot raiseDispute while job is still Funded
+        vm.prank(providerA);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAgentEscrow.InvalidState.selector,
+                IAgentEscrow.JobState.Funded,
+                IAgentEscrow.JobState.Completed
+            )
+        );
+        escrow.raiseDispute(jobId3, "premature dispute");
+
+        vm.prank(providerA);
+        escrow.submitResult(jobId3, keccak256("timely_report"), "http://127.0.0.1:18901/deliverables/3");
+        _assertEqUint(escrow.providerStakes(providerA), 1_000, "providerA stake 1_000 after locking 2_000");
+
+        IAgentEscrow.Job memory job3 = escrow.getJob(jobId3);
+        vm.warp(job3.evaluationDeadline + 1);
+
+        uint256 provABeforeTimeout = usdc.balanceOf(providerA);
+        escrow.claimEvaluationTimeout(jobId3);
+        _assertEqUint(escrow.providerStakes(providerA), 3_000, "providerA bond unlocked on evaluator timeout");
+        _assertEqUint(escrow.evaluatorStakes(evaluator), 0, "unresponsive evaluator stake slashed to 0");
+        _assertEqUint(usdc.balanceOf(providerA) - provABeforeTimeout, 1_500, "providerA received 1_500 automatic timeout slash compensation");
+
+        // Also test timeout slash when evaluatorStake >= job.evaluatorFee (e.g. stake=3_000, fee=2_000)
+        vm.prank(evaluator);
+        escrow.stakeEvaluator(3_000);
+        vm.prank(agentSessionKey);
+        uint256 jobId4 = vault.fundJob(address(escrow), providerA, evaluator, 40_000, block.timestamp + 3600);
+        vm.prank(providerA);
+        escrow.submitResult(jobId4, keccak256("timely_report_4"), "http://127.0.0.1:18901/deliverables/4");
+        IAgentEscrow.Job memory job4 = escrow.getJob(jobId4);
+        vm.warp(job4.evaluationDeadline + 1);
+        escrow.claimEvaluationTimeout(jobId4);
+        _assertEqUint(escrow.evaluatorStakes(evaluator), 1_000, "evaluator slashed exactly job.evaluatorFee (2_000), leaving 1_000");
+
+        // 6. Dispute authorization checks (vault sessionKey, vault owner, direct EOA client, unauthorized attacker)
+        //    - Unauthorized attacker cannot raiseDispute on jobId2 (vault client)
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, address(vault))
+        );
+        escrow.raiseDispute(jobId2, "attacker dispute");
+
+        //    - Vault agentSessionKey can raiseDispute on jobId2, and Owner can slash to job.client (vault)
+        vm.prank(agentSessionKey);
+        escrow.raiseDispute(jobId2, "Client challenges evaluator pass verdict");
+        uint256 vaultBeforeClientSlash = usdc.balanceOf(address(vault));
+        escrow.slashEvaluator(jobId2, address(vault), 500, "Compensate buyer vault");
+        _assertEqUint(usdc.balanceOf(address(vault)) - vaultBeforeClientSlash, 500, "vault received 500 slashed stake");
+
+        //    - Vault owner can also raiseDispute on jobId1
+        escrow.raiseDispute(jobId1, "Vault owner raises dispute");
+
+        //    - Direct EOA client can raiseDispute, while attacker on EOA client job reverts UnauthorizedCaller
+        address eoaBuyer = address(0xB0B0);
+        usdc.mint(eoaBuyer, 20_000);
+        vm.prank(eoaBuyer);
+        usdc.approve(address(escrow), 20_000);
+        escrow.setRequireProviderBond(false);
+        vm.prank(eoaBuyer);
+        uint256 eoaJob = escrow.createAndFundJob(providerA, evaluator, 20_000, block.timestamp + 3600);
+        vm.prank(providerA);
+        escrow.submitResult(eoaJob, keccak256("eoa_res"));
+        vm.prank(evaluator);
+        escrow.completeJob(eoaJob);
+
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentEscrow.UnauthorizedCaller.selector, attacker, eoaBuyer)
+        );
+        escrow.raiseDispute(eoaJob, "attacker on eoa job");
+
+        vm.prank(eoaBuyer);
+        escrow.raiseDispute(eoaJob, "direct EOA client dispute");
+        _assertEqBool(escrow.jobDisputed(eoaJob), true, "eoaJob disputed by eoaBuyer");
     }
 
     /// @notice Additional edge cases for ERC20 transfer failures, direct EOA client in Escrow, and cross-window refund.

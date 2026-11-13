@@ -23,6 +23,8 @@ interface IAgentVault {
     error TransferFailed();
 
     function spendDirect(address to, uint256 amount) external;
+    function owner() external view returns (address);
+    function agentSessionKey() external view returns (address);
     function fundJob(
         address escrow,
         address provider,

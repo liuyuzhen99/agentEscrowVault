@@ -47,6 +47,18 @@ interface IAgentEscrow {
         uint256 slashAmount,
         string reason
     );
+    event EncryptionPublicKeyRegistered(address indexed account, bytes pubKey);
+    event ProviderStaked(address indexed provider, uint256 amount, uint256 totalStake);
+    event ProviderUnstaked(address indexed provider, uint256 amount, uint256 remainingStake);
+    event ProviderBondLocked(uint256 indexed jobId, address indexed provider, uint256 bondAmount);
+    event ProviderBondUnlocked(uint256 indexed jobId, address indexed provider, uint256 bondAmount);
+    event ProviderBondSlashedToEvaluator(
+        uint256 indexed jobId,
+        address indexed provider,
+        address indexed evaluator,
+        uint256 bondAmount
+    );
+    event DisputeRaised(uint256 indexed jobId, address indexed disputant, string reason);
 
     error InvalidState(JobState current, JobState expected);
     error UnauthorizedCaller(address caller, address expected);
@@ -58,8 +70,11 @@ interface IAgentEscrow {
     error FeeTooHigh(uint256 requestedBps, uint256 maxBps);
     error InvalidEvaluationPeriod();
     error InsufficientEvaluatorStake(uint256 currentStake, uint256 requiredStake);
+    error InsufficientProviderBond(uint256 availableStake, uint256 requiredBond);
     error InvalidSlashAmount(uint256 requested, uint256 available);
     error InvalidRecipient();
+    error InvalidPublicKey();
+    error DisputeNotRaised(uint256 jobId);
     error TransferFailed();
 
     function createAndFundJob(
@@ -76,11 +91,19 @@ interface IAgentEscrow {
     function claimTimeoutRefund(uint256 jobId) external;
     function claimEvaluationTimeout(uint256 jobId) external;
 
+    function registerEncryptionPublicKey(bytes calldata pubKey) external;
+    function registerVaultEncryptionPublicKey(address vault, bytes calldata pubKey) external;
+    function getEncryptionPublicKey(address account) external view returns (bytes memory);
+
     function setEvaluationPeriod(uint256 newPeriod) external;
     function setEvaluatorFeeBps(uint256 newFeeBps) external;
     function setMinEvaluatorStake(uint256 newMinStake) external;
+    function setRequireProviderBond(bool required) external;
     function stakeEvaluator(uint256 amount) external;
     function unstakeEvaluator(uint256 amount) external;
+    function stakeProvider(uint256 amount) external;
+    function unstakeProvider(uint256 amount) external;
+    function raiseDispute(uint256 jobId, string calldata reason) external;
     function slashEvaluator(
         uint256 jobId,
         address recipient,
@@ -88,7 +111,12 @@ interface IAgentEscrow {
         string calldata reason
     ) external;
     function minEvaluatorStake() external view returns (uint256);
+    function requireProviderBond() external view returns (bool);
     function evaluatorStakes(address evaluator) external view returns (uint256);
+    function providerStakes(address provider) external view returns (uint256);
+    function jobProviderBonds(uint256 jobId) external view returns (uint256);
+    function jobDisputed(uint256 jobId) external view returns (bool);
+    function jobDisputant(uint256 jobId) external view returns (address);
     function jobs(uint256 jobId) external view returns (Job memory);
     function getJob(uint256 jobId) external view returns (Job memory);
 }

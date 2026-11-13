@@ -14,7 +14,7 @@ from agent_runtime.x402 import (
 )
 from agent_runtime.tools import TOOL_SCHEMAS, AgentToolbox
 from agent_runtime.evaluator import EvaluatorAgent, detect_prompt_injection
-from agent_runtime.provider import ProviderAgent
+from agent_runtime.provider import PersistentDeliverableStore, ProviderAgent
 from agent_runtime.client_agent import ClientAgent
 
 __all__ = [
@@ -37,6 +37,7 @@ __all__ = [
     "AgentToolbox",
     "EvaluatorAgent",
     "detect_prompt_injection",
+    "PersistentDeliverableStore",
     "ProviderAgent",
     "ClientAgent",
 ]

@@ -20,8 +20,14 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
     uint256 public evaluationPeriod = 1 hours;
     uint256 public evaluatorFeeBps = 500; // Default 5% (500 bps)
     uint256 public minEvaluatorStake;
+    bool public requireProviderBond;
 
     mapping(address => uint256) public evaluatorStakes;
+    mapping(address => uint256) public providerStakes;
+    mapping(uint256 => uint256) public jobProviderBonds;
+    mapping(uint256 => bool) public jobDisputed;
+    mapping(uint256 => address) public jobDisputant;
+    mapping(address => bytes) public encryptionPublicKeys;
     mapping(uint256 => Job) private _jobs;
 
     constructor(address usdcAddress) {
@@ -44,6 +50,43 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
         _;
     }
 
+    function _deriveAddressFromPubKey(bytes calldata pubKey) internal pure returns (address) {
+        if (pubKey.length != 65 || pubKey[0] != 0x04) {
+            revert InvalidPublicKey();
+        }
+        return address(uint160(uint256(keccak256(pubKey[1:]))));
+    }
+
+    function registerEncryptionPublicKey(bytes calldata pubKey) external override {
+        address derived = _deriveAddressFromPubKey(pubKey);
+        if (derived != msg.sender) {
+            revert InvalidPublicKey();
+        }
+        encryptionPublicKeys[msg.sender] = pubKey;
+        emit EncryptionPublicKeyRegistered(msg.sender, pubKey);
+    }
+
+    function registerVaultEncryptionPublicKey(address vault, bytes calldata pubKey) external override {
+        if (vault == address(0) || vault.code.length == 0) {
+            revert InvalidRecipient();
+        }
+        address vaultOwner = IAgentVault(vault).owner();
+        address vaultSessionKey = IAgentVault(vault).agentSessionKey();
+        if (msg.sender != vaultOwner && msg.sender != vaultSessionKey) {
+            revert UnauthorizedCaller(msg.sender, vaultSessionKey);
+        }
+        address keySigner = _deriveAddressFromPubKey(pubKey);
+        if (keySigner != vaultSessionKey && keySigner != vaultOwner) {
+            revert InvalidPublicKey();
+        }
+        encryptionPublicKeys[vault] = pubKey;
+        emit EncryptionPublicKeyRegistered(vault, pubKey);
+    }
+
+    function getEncryptionPublicKey(address account) external view override returns (bytes memory) {
+        return encryptionPublicKeys[account];
+    }
+
     function setEvaluationPeriod(uint256 newPeriod) external override onlyOwner {
         if (newPeriod == 0) revert InvalidEvaluationPeriod();
         evaluationPeriod = newPeriod;
@@ -58,6 +101,10 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
 
     function setMinEvaluatorStake(uint256 newMinStake) external override onlyOwner {
         minEvaluatorStake = newMinStake;
+    }
+
+    function setRequireProviderBond(bool required) external override onlyOwner {
+        requireProviderBond = required;
     }
 
     function stakeEvaluator(uint256 amount) external override nonReentrant {
@@ -81,15 +128,71 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
         emit EvaluatorUnstaked(msg.sender, amount, remaining);
     }
 
+    function stakeProvider(uint256 amount) external override nonReentrant {
+        if (amount == 0) {
+            revert InvalidSlashAmount(0, providerStakes[msg.sender]);
+        }
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 newStake = providerStakes[msg.sender] + amount;
+        providerStakes[msg.sender] = newStake;
+        emit ProviderStaked(msg.sender, amount, newStake);
+    }
+
+    function unstakeProvider(uint256 amount) external override nonReentrant {
+        uint256 available = providerStakes[msg.sender];
+        if (amount == 0 || amount > available) {
+            revert InvalidSlashAmount(amount, available);
+        }
+        uint256 remaining = available - amount;
+        providerStakes[msg.sender] = remaining;
+        usdc.safeTransfer(msg.sender, amount);
+        emit ProviderUnstaked(msg.sender, amount, remaining);
+    }
+
+    function _isAuthorizedDisputant(Job storage job, address caller) internal view returns (bool) {
+        if (caller == job.client || caller == job.provider) {
+            return true;
+        }
+        if (job.client.code.length > 0) {
+            return (
+                caller == IAgentVault(job.client).agentSessionKey() ||
+                caller == IAgentVault(job.client).owner()
+            );
+        }
+        return false;
+    }
+
+    function raiseDispute(uint256 jobId, string calldata reason) external override {
+        Job storage job = _jobs[jobId];
+        if (job.state != JobState.Completed && job.state != JobState.Rejected) {
+            revert InvalidState(job.state, JobState.Completed);
+        }
+        if (!_isAuthorizedDisputant(job, msg.sender)) {
+            revert UnauthorizedCaller(msg.sender, job.client);
+        }
+        jobDisputed[jobId] = true;
+        jobDisputant[jobId] = msg.sender;
+        emit DisputeRaised(jobId, msg.sender, reason);
+    }
+
     function slashEvaluator(
         uint256 jobId,
         address recipient,
         uint256 slashAmount,
         string calldata reason
     ) external override nonReentrant onlyOwner {
-        address ev = _jobs[jobId].evaluator;
-        if (recipient == address(0) || ev == address(0)) {
+        Job storage job = _jobs[jobId];
+        address ev = job.evaluator;
+        if (
+            ev == address(0) ||
+            recipient == address(0) ||
+            recipient == owner ||
+            (recipient != job.client && recipient != job.provider)
+        ) {
             revert InvalidRecipient();
+        }
+        if (!jobDisputed[jobId]) {
+            revert DisputeNotRaised(jobId);
         }
         uint256 available = evaluatorStakes[ev];
         if (slashAmount == 0 || slashAmount > available) {
@@ -163,6 +266,16 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
             revert DeadlinePassed(job.deadline, block.timestamp);
         }
 
+        uint256 requiredBond = job.evaluatorFee;
+        uint256 availableStake = providerStakes[msg.sender];
+        if (availableStake >= requiredBond && requiredBond > 0) {
+            providerStakes[msg.sender] = availableStake - requiredBond;
+            jobProviderBonds[jobId] = requiredBond;
+            emit ProviderBondLocked(jobId, msg.sender, requiredBond);
+        } else if (requireProviderBond) {
+            revert InsufficientProviderBond(availableStake, requiredBond);
+        }
+
         uint256 evalDeadline = block.timestamp + evaluationPeriod;
         job.resultHash = resultHash;
         job.dataUri = dataUri;
@@ -188,6 +301,13 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
         uint256 fee = job.evaluatorFee;
         uint256 providerPayout = job.amount - fee;
 
+        uint256 lockedBond = jobProviderBonds[jobId];
+        if (lockedBond > 0) {
+            jobProviderBonds[jobId] = 0;
+            providerStakes[job.provider] += lockedBond;
+            emit ProviderBondUnlocked(jobId, job.provider, lockedBond);
+        }
+
         if (fee > 0) {
             usdc.safeTransfer(job.evaluator, fee);
             emit EvaluatorFeePaid(jobId, job.evaluator, fee);
@@ -211,6 +331,14 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
 
         job.state = JobState.Rejected;
         uint256 refundAmount = job.amount;
+
+        uint256 lockedBond = jobProviderBonds[jobId];
+        if (lockedBond > 0) {
+            jobProviderBonds[jobId] = 0;
+            usdc.safeTransfer(job.evaluator, lockedBond);
+            emit ProviderBondSlashedToEvaluator(jobId, job.provider, job.evaluator, lockedBond);
+            emit EvaluatorFeePaid(jobId, job.evaluator, lockedBond);
+        }
 
         _refundClient(job.client, jobId, refundAmount);
 
@@ -242,6 +370,22 @@ contract AgentEscrow is IAgentEscrow, ReentrancyGuard {
         }
 
         job.state = JobState.Expired;
+
+        uint256 lockedBond = jobProviderBonds[jobId];
+        if (lockedBond > 0) {
+            jobProviderBonds[jobId] = 0;
+            providerStakes[job.provider] += lockedBond;
+            emit ProviderBondUnlocked(jobId, job.provider, lockedBond);
+        }
+
+        uint256 evalStake = evaluatorStakes[job.evaluator];
+        uint256 slashPenalty = job.evaluatorFee < evalStake ? job.evaluatorFee : evalStake;
+        if (slashPenalty > 0) {
+            evaluatorStakes[job.evaluator] = evalStake - slashPenalty;
+            usdc.safeTransfer(job.provider, slashPenalty);
+            emit EvaluatorSlashed(jobId, job.evaluator, job.provider, slashPenalty, "EvaluationTimeout");
+        }
+
         _refundClient(job.client, jobId, job.amount);
 
         emit EvaluationTimeoutClaimed(jobId, job.client, job.amount);

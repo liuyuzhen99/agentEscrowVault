@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import secrets
@@ -26,23 +27,40 @@ JUDGE_SYSTEM_PROMPT = (
 
 _PROMPT_INJECTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(r"\bsystem\s+override\b", re.IGNORECASE),
+        re.compile(r"(?:[\[\(\{]\s*system\s+override\b|\bsystem\s+override\s*[:\-])", re.IGNORECASE),
         "Prompt injection detected: SYSTEM OVERRIDE directive in deliverable",
     ),
     (
         re.compile(
-            r"\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|prompts|rules|directions)\b",
+            r"\b(?:ignore|disregard|forget|set\s+aside|bypass|override|abandon)\s+"
+            r"(?:all\s+|any\s+)?(?:previous|prior|above|earlier|preceding|system)\s+"
+            r"(?:instructions|prompts|rules|directions|directives|guidelines)\b",
             re.IGNORECASE,
         ),
         "Prompt injection detected: instruction-override directive in deliverable",
+    ),
+    (
+        re.compile(
+            r"(?:忽视|忽略|无视|跳过|覆盖).{0,12}(?:之前|以前|先前|上述|原有|系统).{0,12}(?:指示|指令|规则|提示|要求)"
+        ),
+        "Prompt injection detected: Chinese instruction-override directive in deliverable",
+    ),
+    (
+        re.compile(
+            r"(?:直接|立即|务必|强制).{0,8}(?:输出|返回|判为|判定为|给).{0,6}(?:及格|通过|PASS|满分)"
+        ),
+        "Prompt injection detected: Chinese forced-PASS verdict directive in deliverable",
     ),
     (
         re.compile(r"\byou\s+are\s+now\s+(?:a|an|the)\b", re.IGNORECASE),
         "Prompt injection detected: role-hijack directive in deliverable",
     ),
     (
-        re.compile(r'"verdict"\s*:\s*"pass"', re.IGNORECASE),
-        "Prompt injection detected: embedded forged PASS verdict JSON in deliverable",
+        re.compile(
+            r"\b(?:output|return|respond(?:\s+with)?|print|emit|write)\s*[:\-]?\s*\{[^}]*\"verdict\"\s*:\s*\"pass\"",
+            re.IGNORECASE,
+        ),
+        "Prompt injection detected: imperative forged PASS verdict JSON in deliverable",
     ),
     (
         re.compile(r"<\s*/?\s*untrusted_deliverable_sandbox_", re.IGNORECASE),
@@ -50,12 +68,34 @@ _PROMPT_INJECTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
 )
 
+_BASE64_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9+/=])")
+
+
+def _scan_plain_injection(text: str) -> str | None:
+    for pattern, description in _PROMPT_INJECTION_PATTERNS:
+        if pattern.search(text):
+            return description
+    return None
+
 
 def detect_prompt_injection(deliverable_content: str) -> str | None:
-    """Scan untrusted deliverable content for prompt-injection / jailbreak patterns before LLM invocation."""
-    for pattern, description in _PROMPT_INJECTION_PATTERNS:
-        if pattern.search(deliverable_content):
-            return description
+    """Scan untrusted deliverable content (including Base64 payloads) for prompt-injection / jailbreak directives."""
+    direct_hit = _scan_plain_injection(deliverable_content)
+    if direct_hit is not None:
+        return direct_hit
+
+    for candidate in _BASE64_CANDIDATE_RE.findall(deliverable_content):
+        if len(candidate) % 4 != 0:
+            continue
+        try:
+            decoded_bytes = base64.b64decode(candidate, validate=True)
+            decoded_text = decoded_bytes.decode("utf-8")
+        except Exception:
+            continue
+        nested_hit = _scan_plain_injection(decoded_text)
+        if nested_hit is not None:
+            return f"Prompt injection detected: Base64-encoded jailbreak payload ({nested_hit})"
+
     return None
 
 

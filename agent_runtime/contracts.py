@@ -389,3 +389,119 @@ class ContractManager:
         eval_cs = Web3.to_checksum_address(evaluator_address)
         return int(self._escrow.functions.evaluatorStakes(eval_cs).call())
 
+    @staticmethod
+    def _to_uncompressed_65_bytes(pubkey_hex: str) -> bytes:
+        raw_bytes = bytes.fromhex(pubkey_hex.strip().removeprefix("0x").removeprefix("0X"))
+        if len(raw_bytes) == 64:
+            return b"\x04" + raw_bytes
+        if len(raw_bytes) == 65 and raw_bytes[0] == 0x04:
+            return raw_bytes
+        raise ValueError(f"Expected 64-byte or 65-byte (0x04...) secp256k1 public key, got {len(raw_bytes)} bytes")
+
+    def register_encryption_public_key(
+        self, pubkey_hex: str, signer_private_key: str | None = None
+    ) -> dict[str, Any]:
+        """Register an uncompressed 65-byte secp256k1 encryption public key on AgentEscrow."""
+        raw_bytes = self._to_uncompressed_65_bytes(pubkey_hex)
+        key = signer_private_key or self._evaluator_key or self._agent_key or self._owner_key
+        acct = Account.from_key(key)
+        call = self._escrow.functions.registerEncryptionPublicKey(raw_bytes)
+        receipt = self._send_tx(call, key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "account": acct.address,
+            "pubkey_hex": "0x" + raw_bytes.hex(),
+        }
+
+    def register_vault_encryption_public_key(
+        self,
+        pubkey_hex: str,
+        vault_address: str | None = None,
+        signer_private_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Register the encryption public key for an AgentVault on AgentEscrow (owner or sessionKey)."""
+        raw_bytes = self._to_uncompressed_65_bytes(pubkey_hex)
+        vault_cs = Web3.to_checksum_address(vault_address or self._vault_address)
+        key = signer_private_key or self._agent_key or self._owner_key
+        call = self._escrow.functions.registerVaultEncryptionPublicKey(vault_cs, raw_bytes)
+        receipt = self._send_tx(call, key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "vault": vault_cs,
+            "pubkey_hex": "0x" + raw_bytes.hex(),
+        }
+
+    def get_encryption_public_key(self, account_address: str) -> str:
+        """Query the registered 65-byte uncompressed secp256k1 encryption public key from AgentEscrow."""
+        acct_cs = Web3.to_checksum_address(account_address)
+        raw_bytes = bytes(self._escrow.functions.getEncryptionPublicKey(acct_cs).call())
+        if not raw_bytes:
+            return ""
+        return "0x" + raw_bytes.hex()
+
+    def set_require_provider_bond(self, required: bool) -> dict[str, Any]:
+        """Enable or disable mandatory provider performance bond on AgentEscrow (Owner only)."""
+        call = self._escrow.functions.setRequireProviderBond(bool(required))
+        receipt = self._send_tx(call, self._owner_key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "require_provider_bond": bool(required),
+        }
+
+    def stake_provider(
+        self, amount_raw: int, provider_private_key: str
+    ) -> dict[str, Any]:
+        """Approve USDC and stake into AgentEscrow as a Provider performance bond pool."""
+        acct = Account.from_key(provider_private_key)
+        allowance = self._usdc.functions.allowance(acct.address, self._escrow_address).call()
+        if int(allowance) < int(amount_raw):
+            approve_call = self._usdc.functions.approve(self._escrow_address, int(amount_raw))
+            self._send_tx(approve_call, provider_private_key)
+        stake_call = self._escrow.functions.stakeProvider(int(amount_raw))
+        receipt = self._send_tx(stake_call, provider_private_key)
+        total_stake = int(self._escrow.functions.providerStakes(acct.address).call())
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "provider": acct.address,
+            "staked_raw": int(amount_raw),
+            "total_stake_raw": total_stake,
+        }
+
+    def unstake_provider(
+        self, amount_raw: int, provider_private_key: str
+    ) -> dict[str, Any]:
+        """Withdraw unlocked Provider USDC bond from AgentEscrow."""
+        acct = Account.from_key(provider_private_key)
+        call = self._escrow.functions.unstakeProvider(int(amount_raw))
+        receipt = self._send_tx(call, provider_private_key)
+        remaining_stake = int(self._escrow.functions.providerStakes(acct.address).call())
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "provider": acct.address,
+            "unstaked_raw": int(amount_raw),
+            "remaining_stake_raw": remaining_stake,
+        }
+
+    def get_provider_stake(self, provider_address: str) -> int:
+        """Query unlocked USDC bond balance (raw 6-decimal units) of a Provider on AgentEscrow."""
+        prov_cs = Web3.to_checksum_address(provider_address)
+        return int(self._escrow.functions.providerStakes(prov_cs).call())
+
+    def raise_dispute(
+        self,
+        job_id: int,
+        reason: str,
+        caller_private_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Raise an on-chain party dispute on a Completed/Rejected job before evaluator slashing."""
+        key = caller_private_key or self._agent_key or self._owner_key
+        acct = Account.from_key(key)
+        call = self._escrow.functions.raiseDispute(int(job_id), str(reason))
+        receipt = self._send_tx(call, key)
+        return {
+            "tx_hash": receipt["transactionHash"].hex(),
+            "job_id": int(job_id),
+            "disputant": acct.address,
+            "reason": str(reason),
+        }
+
